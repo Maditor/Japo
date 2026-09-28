@@ -1462,6 +1462,144 @@ def run_ui():
 
     menu.add_checkbutton(label="Detect speaker gender", variable=gender_var, command=set_gender)
     menu.add_separator()
+    # ---------------------------------------------------------------- API keys dialog
+    def open_api_dialog():
+        if getattr(open_api_dialog, "win", None) and open_api_dialog.win.winfo_exists():
+            open_api_dialog.win.lift()
+            return
+        cf = read_cloudflare() or ("", "")
+        gm = read_gemini_key() or ""
+
+        win = tk.Toplevel(root)
+        open_api_dialog.win = win
+        win.title("API keys")
+        win.configure(bg=C["bg"])
+        win.resizable(False, False)
+        win.transient(root)
+        win.attributes("-topmost", True)
+        pad = px(16)
+
+        def label(parent, text, small=False):
+            return tk.Label(parent, text=text, bg=C["bg"], fg=C["muted"] if small else C["text"],
+                            font=(UI, 8 if small else 9, "normal" if small else "bold"),
+                            anchor="w", justify="left")
+
+        def entry(parent, value, secret=False):
+            e = tk.Entry(parent, font=(UI, 9), relief="flat", bd=0, highlightthickness=1,
+                         bg=C["surface"], fg=C["text"], insertbackground=C["text"],
+                         highlightbackground=C["border"], highlightcolor=C["accent"],
+                         show="•" if secret else "", width=42)
+            e.insert(0, value)
+            return e
+
+        body_f = tk.Frame(win, bg=C["bg"])
+        body_f.pack(fill="both", padx=pad, pady=(pad, px(8)))
+
+        label(body_f, "Cloudflare Workers AI").pack(fill="x")
+        label(body_f, "Used for AI translation (Gemma). Create a token with the “Workers AI” template.",
+              small=True).pack(fill="x", pady=(0, px(8)))
+
+        label(body_f, "Account ID", small=True).pack(fill="x")
+        acc_e = entry(body_f, cf[0])
+        acc_e.pack(fill="x", ipady=px(4), pady=(px(2), px(8)))
+
+        label(body_f, "API token", small=True).pack(fill="x")
+        tok_row = tk.Frame(body_f, bg=C["bg"])
+        tok_row.pack(fill="x", pady=(px(2), px(4)))
+        tok_e = entry(tok_row, cf[1], secret=True)
+        tok_e.pack(side="left", fill="x", expand=True, ipady=px(4))
+
+        def toggle_show():
+            tok_e.config(show="" if tok_e.cget("show") else "•")
+            gem_e.config(show="" if gem_e.cget("show") else "•")
+        show_btn = tk.Label(tok_row, text="Show", bg=C["surface"], fg=C["text"], font=(UI, 8),
+                            padx=px(8), pady=px(4), cursor="hand2")
+        show_btn.pack(side="left", padx=(px(6), 0))
+        show_btn.bind("<Button-1>", lambda e: toggle_show())
+
+        link = tk.Label(body_f, text="Get a token →", bg=C["bg"], fg=C["en"], font=(UI, 8, "underline"),
+                        cursor="hand2", anchor="w")
+        link.pack(fill="x", pady=(0, px(12)))
+        link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
+            "https://dash.cloudflare.com/profile/api-tokens"))
+
+        label(body_f, "Gemini (optional)").pack(fill="x")
+        label(body_f, "Fallback when Cloudflare is unavailable.", small=True).pack(fill="x", pady=(0, px(6)))
+        gem_e = entry(body_f, gm, secret=True)
+        gem_e.pack(fill="x", ipady=px(4), pady=(0, px(4)))
+
+        status_l = label(body_f, "", small=True)
+        status_l.pack(fill="x", pady=(px(8), 0))
+
+        btns = tk.Frame(win, bg=C["bg"])
+        btns.pack(fill="x", padx=pad, pady=(0, pad))
+
+        def mk_btn(text, cmd, primary=False):
+            b = tk.Label(btns, text=text, font=(UI, 9, "bold" if primary else "normal"),
+                         bg=C["accent"] if primary else C["surface"],
+                         fg="#ffffff" if primary else C["text"],
+                         padx=px(14), pady=px(6), cursor="hand2")
+            b.bind("<Button-1>", lambda e: cmd())
+            return b
+
+        def write_or_remove(path, content):
+            if content.strip():
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content.strip() + "\n")
+            elif os.path.exists(path):
+                os.remove(path)
+
+        def save():
+            acc, tok, gem = acc_e.get().strip(), tok_e.get().strip(), gem_e.get().strip()
+            if tok.lower().startswith("bearer "):
+                tok = tok[7:].strip()
+            if bool(acc) != bool(tok):
+                status_l.config(text="Please fill in both Account ID and API token.", fg=C["warn"])
+                return
+            try:
+                write_or_remove(os.path.join(APP_DIR, "cloudflare.txt"), f"{acc}\n{tok}" if acc else "")
+                write_or_remove(os.path.join(APP_DIR, "gemini_key.txt"), gem)
+            except OSError as e:
+                status_l.config(text=f"Could not save: {e}", fg=C["err"])
+                return
+            engine.cloudflare = read_cloudflare()
+            engine.gemini_key = read_gemini_key()
+            engine.gemini_note = None
+            win.destroy()
+
+        def test():
+            acc, tok = acc_e.get().strip(), tok_e.get().strip()
+            if not tok:
+                status_l.config(text="Enter an API token first.", fg=C["warn"])
+                return
+            status_l.config(text="Testing…", fg=C["muted"])
+
+            def work():
+                try:
+                    import requests
+                    r = requests.get("https://api.cloudflare.com/client/v4/user/tokens/verify",
+                                     headers={"Authorization": f"Bearer {tok}"}, timeout=10)
+                    ok = r.ok and r.json().get("result", {}).get("status") == "active"
+                    msg = ("Token is valid ✓", C["ok"]) if ok else ("Invalid token", C["err"])
+                except Exception as e:
+                    msg = (f"Could not connect: {type(e).__name__}", C["err"])
+                root.after(0, lambda: status_l.winfo_exists() and status_l.config(text=msg[0], fg=msg[1]))
+            threading.Thread(target=work, daemon=True).start()
+
+        mk_btn("Save", save, primary=True).pack(side="right")
+        mk_btn("Cancel", win.destroy).pack(side="right", padx=(0, px(8)))
+        mk_btn("Test", test).pack(side="left")
+
+        win.bind("<Return>", lambda e: save())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        x = root.winfo_rootx() + (root.winfo_width() - win.winfo_width()) // 2
+        y = root.winfo_rooty() + px(60)
+        x = min(x, root.winfo_screenwidth() - win.winfo_width() - px(8))
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        acc_e.focus_set()
+
+    menu.add_command(label="API keys…", command=open_api_dialog)
     menu.add_command(label="Save subtitles (.txt)…", command=save_txt)
     menu.add_command(label="Open Japo folder", command=lambda: os.startfile(APP_DIR)
                      if os.name == "nt" else None)

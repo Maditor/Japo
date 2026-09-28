@@ -60,15 +60,11 @@ Cài xong **đóng cmd, mở lại** rồi gõ `python --version`, thấy `Pytho
 2. Lấy **Account ID**: nằm trong trang *Workers AI*, hoặc là dãy 32 ký tự trên thanh địa chỉ ngay sau `dash.cloudflare.com/`.
 3. Tạo **API Token**: vào [trang API Tokens](https://dash.cloudflare.com/profile/api-tokens) → **Create Token** → chọn mẫu **Workers AI** → tạo và copy token.
    Chú ý: phải là **API Token**, không phải *Global API Key*.
-4. Trong thư mục Japo, copy file `cloudflare.example.txt` thành **`cloudflare.txt`**, rồi sửa nội dung thành:
-   ```
-   Account-ID-của-bạn
-   API-token-của-bạn
-   ```
-   Dòng 1 là Account ID, dòng 2 là token. Không thêm chữ `Bearer`, không để dấu cách thừa.
-5. Mở lại Japo. Thanh dưới cùng hiện **Gemma** là đang dịch bằng AI.
+4. Mở Japo, bấm **⚙ → API keys…**, dán **Account ID** và **API token** vào, bấm **Test** để kiểm tra rồi bấm **Save**. Không cần khởi động lại app.
+   *(Cách thủ công: copy `cloudflare.example.txt` thành `cloudflare.txt`, dòng 1 là Account ID, dòng 2 là token.)*
+5. Bấm **Test** thấy dòng **Token is valid ✓** là đã kết nối được. Từ câu tiếp theo, Japo dịch bằng AI (Gemma).
 
-*(Tuỳ chọn)* **Gemini:** tạo key tại [Google AI Studio](https://aistudio.google.com/apikey), rồi dán vào file **`gemini_key.txt`** đặt cạnh `japo.py`.
+*(Tuỳ chọn)* **Gemini:** tạo key tại [Google AI Studio](https://aistudio.google.com/apikey), rồi dán vào ô **Gemini** trong cửa sổ **API keys**.
 
 > ⚠️ **Không bao giờ đưa `cloudflare.txt` hay `gemini_key.txt` lên GitHub hay gửi cho người khác.** File `.gitignore` đã chặn sẵn 2 file này.
 
@@ -101,6 +97,7 @@ Cài xong **đóng cmd, mở lại** rồi gõ `python --version`, thấy `Pytho
 - **Uncensored translation:** dịch sát nghĩa, không nói giảm nói tránh
 - **Show romaji:** hiện phiên âm Latin thay cho chữ Nhật
 - **Detect speaker gender:** đoán giọng nam/nữ
+- **API keys…:** nhập Account ID, token Cloudflare và key Gemini
 - **Save subtitles (.txt):** lưu toàn bộ phụ đề ra file
 - **Open Japo folder:** mở thư mục chứa app
 
