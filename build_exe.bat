@@ -18,6 +18,7 @@ echo === 2/4 Building (this takes a few minutes) ===
   --name "Japo" ^
   --icon "icon.ico" ^
   --add-data "icon.ico;." ^
+  --add-data "icon_light.ico;." ^
   --collect-all faster_whisper ^
   --collect-all ctranslate2 ^
   --collect-binaries pyaudiowpatch ^

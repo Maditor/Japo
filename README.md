@@ -1,5 +1,7 @@
 # Japo
 
+**Tác giả:** [Maditor](https://github.com/Maditor) · **Repo:** [github.com/Maditor/Japo](https://github.com/Maditor/Japo)
+
 Phụ đề **thời gian thực** cho video tiếng Nhật trên Windows.
 Japo nghe âm thanh đang phát trên máy (YouTube, trình phát phim, trình duyệt…), nhận diện lời thoại bằng **Whisper**, dịch sang **tiếng Việt** và hiện từng câu trong một thanh dọc gọn gàng bên cạnh màn hình.
 
@@ -142,7 +144,7 @@ Model không nằm trong bộ cài (quá nặng), app sẽ tự tải ở lần 
 |---|---|
 | `japo.py` | Mã nguồn chính |
 | `japo_icons.py` | Icon giao diện (ảnh nhúng sẵn) |
-| `icon.ico` | Icon app |
+| `icon.ico`, `icon_light.ico` | Icon app (bản tối / bản sáng, tự đổi theo theme) |
 | `requirements.txt` | Danh sách thư viện Python |
 | `setup.bat` | Cài môi trường + thư viện |
 | `run.bat` | Chạy Japo |

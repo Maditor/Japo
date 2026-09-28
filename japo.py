@@ -912,14 +912,20 @@ def run_ui():
     root.title("Japo")
     paint(root, bg="bg")
     root.attributes("-topmost", state["topmost"])
-    for base in (getattr(sys, "_MEIPASS", ""), APP_DIR):
-        ico = os.path.join(base, "icon.ico") if base else ""
-        if ico and os.path.isfile(ico):
-            try:
-                root.iconbitmap(default=ico)
-            except Exception:
-                pass
-            break
+    def set_window_icon():
+        """Title bar / taskbar icon follows the theme (icon.ico = dark, icon_light.ico = light)."""
+        name = "icon_light.ico" if state.get("theme") == "light" else "icon.ico"
+        for base in (getattr(sys, "_MEIPASS", ""), APP_DIR):
+            for fname in (name, "icon.ico"):
+                ico = os.path.join(base, fname) if base else ""
+                if ico and os.path.isfile(ico):
+                    try:
+                        root.iconbitmap(default=ico)
+                    except Exception:
+                        pass
+                    return
+
+    set_window_icon()
 
     scale = root.winfo_fpixels("1i") / 96.0
     px = lambda v: int(v * scale)
@@ -1466,6 +1472,7 @@ def run_ui():
         C.update(THEMES[state["theme"]])
         apply_opacity()
         style_titlebar()
+        set_window_icon()
         save_settings()
 
     def repaint():
