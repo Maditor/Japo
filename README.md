@@ -1,7 +1,5 @@
 # Japo
 
-**Tác giả:** [Maditor](https://github.com/Maditor) · **Repo:** [github.com/Maditor/Japo](https://github.com/Maditor/Japo)
-
 Phụ đề **thời gian thực** cho video tiếng Nhật trên Windows.
 Japo nghe âm thanh đang phát trên máy (YouTube, trình phát phim, trình duyệt…), nhận diện lời thoại bằng **Whisper**, dịch sang **tiếng Việt** và hiện từng câu trong một thanh dọc gọn gàng bên cạnh màn hình.
 
