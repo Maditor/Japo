@@ -1,0 +1,9 @@
+faster-whisper>=1.1.0
+PyAudioWPatch
+numpy
+scipy
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.*
+cutlet
+fugashi
+unidic-lite
