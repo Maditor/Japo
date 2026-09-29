@@ -31,6 +31,8 @@ echo === 2/4 Building (this takes a few minutes) ===
   --collect-all ctranslate2 ^
   --collect-binaries pyaudiowpatch ^
   --collect-all cutlet ^
+  --collect-all pypinyin ^
+  --collect-all korean_romanizer ^
   --collect-all fugashi ^
   --collect-all unidic_lite ^
   --collect-binaries nvidia.cublas ^

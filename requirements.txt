@@ -7,3 +7,6 @@ nvidia-cudnn-cu12==9.*
 cutlet
 fugashi
 unidic-lite
+pypinyin
+korean-romanizer
+requests

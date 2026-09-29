@@ -1,5 +1,5 @@
 """
-Japo – real-time subtitles for Japanese audio.
+Japo – real-time subtitles for Japanese, Korean, Chinese and English audio.
 Captures system audio (WASAPI loopback), transcribes it with faster-whisper,
 translates it with an LLM (Cloudflare / Gemini) or machine translation,
 and shows the result in a sidebar window.
@@ -18,8 +18,8 @@ import numpy as np
 MODEL_SIZE = "large-v3-turbo"  # use "small" on slower machines
 DEVICE = "cuda"                # "cuda" (NVIDIA GPU) or "cpu"
 COMPUTE_TYPE = "int8_float16"  # fits 4 GB VRAM
-SOURCE_LANG = "ja"
-TARGET_LANG = "vi"             # "en" for English subtitles
+SOURCE_LANG = "ja"             # "auto", "ja", "ko", "zh", "en"
+TARGET_LANG = "vi"             # any code in TARGET_LANGS
 SILENCE_THRESHOLD = 0.008      # only used when AUTO_GAIN = False
 AUTO_GAIN = True               # works at low playback volume
 SENSITIVITY = 0.22             # lower = catch quiet speech, higher = ignore background music
@@ -27,6 +27,15 @@ SILENCE_SEC = 0.6              # pause length that ends a line
 MAX_SEGMENT_SEC = 8.0          # force a cut after this many seconds
 MIN_SEGMENT_SEC = 0.8          # ignore shorter segments
 SHOW_EN = True                 # also show an English machine translation
+SOURCE_LANGS = {"auto": "Auto detect", "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "en": "English"}
+TARGET_LANGS = {"vi": "Vietnamese", "en": "English", "ja": "Japanese", "ko": "Korean",
+                "zh": "Chinese (Simplified)", "zh-TW": "Chinese (Traditional)", "th": "Thai",
+                "id": "Indonesian", "fr": "French", "es": "Spanish", "de": "German", "ru": "Russian"}
+# Per-service language codes where they differ from the plain ones
+_EDGE_CODE = {"zh": "zh-Hans", "zh-TW": "zh-Hant"}
+_GOOGLE_CODE = {"zh": "zh-CN", "zh-TW": "zh-TW"}
+# Whisper hint per language: primes vocal sounds as interjections (Japanese only)
+_WHISPER_PROMPT = {"ja": "あっ…んっ、イクっ…はぁ…はぁ…。うん。"}
 CLOUDFLARE_MODEL = "@cf/google/gemma-4-26b-a4b-it"  # used when cloudflare.txt exists
 GEMINI_MODEL = "gemini-2.5-flash"                   # used when gemini_key.txt exists
 FILTER_INTERJECTIONS = True    # hide lines that are only short vocal sounds
@@ -159,6 +168,36 @@ def to_romaji(text):
         for a, b in _ROMAJI_FIX.items():
             out = out.replace(a, b).replace(a.capitalize(), b.capitalize())
         return out
+    except Exception:
+        return ""
+
+
+_ROMAN = {}
+
+
+def romanize(text, lang):
+    """Latin-script reading for ja/zh/ko lines; "" for other languages or on failure."""
+    if lang == "ja":
+        return to_romaji(text)
+    if lang not in ("zh", "ko"):
+        return ""
+    if lang not in _ROMAN:
+        _ROMAN[lang] = None
+        try:
+            if lang == "zh":
+                from pypinyin import lazy_pinyin, Style
+                _ROMAN[lang] = lambda t: _re.sub(r"\s+([。，！？、,.!?])", r"\1", " ".join(
+                    w for w in lazy_pinyin(t, style=Style.TONE) if w.strip()))
+            else:
+                from korean_romanizer.romanizer import Romanizer
+                _ROMAN[lang] = lambda t: Romanizer(t).romanize()
+        except Exception as e:
+            print(f"Romanization for {lang} unavailable:", e, flush=True)
+            _ROMAJI["error"] = (f"{'Pinyin' if lang == 'zh' else 'Korean romanization'} unavailable – "
+                                f"run setup.bat (needs {'pypinyin' if lang == 'zh' else 'korean-romanizer'})")
+    fn = _ROMAN[lang]
+    try:
+        return fn(text) if fn else ""
     except Exception:
         return ""
 
@@ -440,6 +479,7 @@ class SubtitleEngine:
         self.device = DEVICE
         self.capture = None
         self.tcfg = default_translators()   # translation providers (see translators.json)
+        self._no_extra = {}                 # providers that rejected the "no thinking" option
         self.ai_cooldown = {}     # provider -> timestamp until which it is skipped
         self.last_service = None  # which translator produced the last line
         self.gemini_note = None   # translation warning shown in the status area
@@ -556,9 +596,9 @@ class SubtitleEngine:
                 buf, speech, silence = [], False, 0.0
 
     def _transcribe(self, audio):
-        segments, _ = self.model.transcribe(
+        segments, info = self.model.transcribe(
             audio,
-            language=SOURCE_LANG,
+            language=None if SOURCE_LANG == "auto" else SOURCE_LANG,
             beam_size=BEAM_SIZE,
             best_of=1,
             temperature=0.0,
@@ -568,18 +608,20 @@ class SubtitleEngine:
             condition_on_previous_text=False,
             without_timestamps=True,
             # Prime Whisper to write vocal sounds as interjections instead of inventing sentences
-            initial_prompt="あっ…んっ、イクっ…はぁ…はぁ…。うん。",
+            initial_prompt=_WHISPER_PROMPT.get(SOURCE_LANG),
             compression_ratio_threshold=2.2,
             log_prob_threshold=-1.0,
             no_speech_threshold=0.5,
         )
+        self.cur_src = (info.language if SOURCE_LANG == "auto" else SOURCE_LANG) or "ja"
         parts = []
         for s in segments:
             t = s.text.strip()
             if keep_segment(t, s.avg_logprob, s.no_speech_prob, s.compression_ratio):
                 t = collapse_repeats(t) or t
                 parts.append(t)
-        return "".join(parts).strip()
+        sep = "" if self.cur_src in ("ja", "zh") else " "
+        return sep.join(parts).strip()
 
     def _transcriber(self):
         while self.running:
@@ -638,9 +680,13 @@ class SubtitleEngine:
                 vi, en = self.translate_line(text, gender)
             except Exception as e:
                 vi, en = f"(translation error: {e})", None
-            self.ui_q.put(("line", ts, text, vi, en, to_romaji(text), gender))
+            self.ui_q.put(("line", ts, text, vi, en, romanize(text, self.src()), gender))
 
     # ------------------------------------------------------------ translation
+    def src(self):
+        """Language of the current line (the detected one in auto mode)."""
+        return SOURCE_LANG if SOURCE_LANG != "auto" else getattr(self, "cur_src", "ja")
+
     def translate_line(self, text, gender=None):
         """Return (main translation, English translation or None)."""
         if not hasattr(self, "_context"):
@@ -650,7 +696,7 @@ class SubtitleEngine:
             self._context = []          # new scene: don't carry over old context
         self._last_line_at = now
         en_future = None
-        if SHOW_EN and TARGET_LANG != "en":
+        if SHOW_EN and TARGET_LANG != "en" and self.src() != "en":
             from concurrent.futures import ThreadPoolExecutor
             if not hasattr(self, "_pool"):
                 self._pool = ThreadPoolExecutor(max_workers=2)
@@ -699,13 +745,14 @@ class SubtitleEngine:
         return vi, en
 
     def _llm_prompt(self, text, gender=None):
-        T = {"vi": "Vietnamese", "en": "English"}.get(TARGET_LANG, TARGET_LANG)
+        T = TARGET_LANGS.get(TARGET_LANG, TARGET_LANG)
+        S = SOURCE_LANGS.get(self.src(), "foreign-language")
         who = {"f": "[female voice] ", "m": "[male voice] "}
         prev = "\n".join(f"- {who.get(g, '')}{ja}  =>  {tr}" for ja, tr, g in self._context)
         speaker = {"f": "female", "m": "male"}.get(gender)
         speaker_line = (f"\nSpeaker: {speaker} voice (guessed from pitch, usually right)." if speaker else "")
         system = (
-            f"You are a professional subtitle translator. Translate Japanese movie dialogue "
+            f"You are a professional subtitle translator. Translate {S} movie dialogue "
             f"into natural, spoken {T}."
         )
         about = self.movie_context.strip()[:1500]
@@ -719,15 +766,19 @@ Line to translate:
 Rules:
 1. Write natural, casual spoken {T} like professional movie subtitles, not word-for-word.
 2. Choose {T} pronouns and forms of address that fit the speakers' relationship, and keep them consistent with the previous lines.
-3. The Japanese comes from speech recognition and may contain misheard words: guess the most plausible meaning from context.
+3. The {S} comes from speech recognition and may contain misheard words: guess the most plausible meaning from context.
 4. Vocal sounds, sound effects and onomatopoeia: render them briefly as an equivalent expression in {T}.
    Use the speaker's gender (when given) to choose natural {T} pronouns and self-reference, and to tell who is talking to whom.
-5. Japanese often uses kinship words as forms of address: a host or stranger may call a woman "お母さん/お母様" (the mother),
-   a young man "お兄さん", an older woman "お姉さん". Translate these as the addressee's role, not as the speaker's own family,
-   unless the context says they really are related. A single line may contain two speakers (question + answer).
+{self._kinship_rule() if self.src() == "ja" else "5. A single line may contain two speakers (question + answer)."}
 6. Keep the original tone, intensity and emotion. Keep punctuation style (…, ?!, !!).
 7. Output ONLY the {T} translation as one line. No notes, no quotes, no original text.{self._uncensored_rules(T)}"""
         return system, prompt
+
+    @staticmethod
+    def _kinship_rule():
+        return ('5. Japanese often uses kinship words' + """ as forms of address: a host or stranger may call a woman "お母さん/お母様" (the mother),
+   a young man "お兄さん", an older woman "お姉さん". Translate these as the addressee's role, not as the speaker's own family,
+   unless the context says they really are related. A single line may contain two speakers (question + answer).""")
 
     def _uncensored_rules(self, T):
         if not self.uncensored:
@@ -858,9 +909,24 @@ Mode: uncensored. The dialogue may contain mature language.
             headers["Authorization"] = f"Bearer {p['api_key']}"
         if pid == "openrouter":
             headers.update({"HTTP-Referer": "https://github.com/Maditor/Japo", "X-Title": "Japo"})
+        # Turn off "thinking" where supported: faster and far fewer tokens per line
+        model = p["model"].lower()
+        extra = {}
+        if pid == "openrouter":
+            extra = {"reasoning": {"enabled": False}}
+        elif pid == "groq":
+            extra = ({"reasoning_effort": "none"} if "qwen" in model else
+                     {"reasoning_effort": "low"} if "gpt-oss" in model else {})
+        if self._no_extra.get(pid):
+            extra = {}
+        body = {"model": p["model"], "temperature": 0.5, "max_tokens": 512,
+                "messages": [{"role": "user", "content": prompt}]}
         r = requests.post(f"{base.rstrip('/')}/chat/completions", headers=headers, timeout=30,
-                          json={"model": p["model"], "temperature": 0.5, "max_tokens": 512,
-                                "messages": [{"role": "user", "content": prompt}]})
+                          json={**body, **extra})
+        if r.status_code == 400 and extra:          # provider rejected the option: retry without
+            self._no_extra[pid] = True
+            r = requests.post(f"{base.rstrip('/')}/chat/completions", headers=headers, timeout=30,
+                              json=body)
         r.raise_for_status()
         out = self._clean_llm(self._extract_text(r.json()))
         if not out:
@@ -926,7 +992,8 @@ Mode: uncensored. The dialogue may contain mature language.
         import requests
         r = requests.get(
             "https://clients5.google.com/translate_a/t",
-            params={"client": "dict-chrome-ex", "sl": SOURCE_LANG, "tl": target, "q": text},
+            params={"client": "dict-chrome-ex", "sl": _GOOGLE_CODE.get(self.src(), self.src()),
+                    "tl": _GOOGLE_CODE.get(target, target), "q": text},
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0"},
             timeout=8,
         )
@@ -940,7 +1007,8 @@ Mode: uncensored. The dialogue may contain mature language.
         import requests
         r = requests.get(
             "https://translate.googleapis.com/translate_a/single",
-            params={"client": "gtx", "sl": SOURCE_LANG, "tl": target, "dt": "t", "q": text},
+            params={"client": "gtx", "sl": _GOOGLE_CODE.get(self.src(), self.src()),
+                    "tl": _GOOGLE_CODE.get(target, target), "dt": "t", "q": text},
             headers={"User-Agent": "Mozilla/5.0"}, timeout=8,
         )
         r.raise_for_status()
@@ -954,7 +1022,7 @@ Mode: uncensored. The dialogue may contain mature language.
         import requests
         r = requests.post(
             "https://edge.microsoft.com/translate/translatetext",
-            params={"from": SOURCE_LANG, "to": target, "isEnterpriseClient": "false"},
+            params={"from": _EDGE_CODE.get(self.src(), self.src()), "to": _EDGE_CODE.get(target, target), "isEnterpriseClient": "false"},
             headers={"Content-Type": "application/json",
                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Edg/126.0"},
             json=[text], timeout=8,
@@ -972,7 +1040,7 @@ Mode: uncensored. The dialogue may contain mature language.
     def _translate_mymemory(self, text, target):
         import requests
         r = requests.get("https://api.mymemory.translated.net/get",
-                         params={"q": text, "langpair": f"{SOURCE_LANG}|{target}"}, timeout=8)
+                         params={"q": text, "langpair": f"{self.src()}|{target}"}, timeout=8)
         r.raise_for_status()
         data = r.json()
         if int(data.get("responseStatus", 0)) != 200:
@@ -986,7 +1054,7 @@ Mode: uncensored. The dialogue may contain mature language.
         """Try services in order; a blocked service (403/429) cools down for 5 min."""
         if not hasattr(self, "_cache"):
             self._cache, self._cooldown = {}, {}
-        key = (text, target)
+        key = (text, self.src(), target)
         if key in self._cache:
             return self._cache[key]
         services = [
@@ -1095,6 +1163,11 @@ def run_ui():
     engine.uncensored = bool(state.get("uncensored"))
     engine.detect_gender = bool(state.get("gender", True))
     engine.movie_context = str(state.get("context", ""))
+    global SOURCE_LANG, TARGET_LANG
+    if state.get("source_lang") in SOURCE_LANGS:
+        SOURCE_LANG = state["source_lang"]
+    if state.get("target_lang") in TARGET_LANGS:
+        TARGET_LANG = state["target_lang"]
     history = []
 
     root = tk.Tk()
@@ -1358,7 +1431,7 @@ def run_ui():
     FlatButton(inner, clear, icon="clear", tip="Clear all").pack(side="left", padx=px(2))
     vsep()
     ja_btn = FlatButton(inner, lambda: toggle_state("show_ja"), text="JP",
-                        tip="Show/hide Japanese", toggle=lambda: state["show_ja"])
+                        tip="Show/hide original text", toggle=lambda: state["show_ja"])
     en_btn = FlatButton(inner, lambda: toggle_state("show_en"), text="EN",
                         tip="Show/hide English", toggle=lambda: state["show_en"])
     ja_btn.pack(side="left", padx=px(2))
@@ -1628,6 +1701,25 @@ def run_ui():
     menu.add_cascade(label="Background opacity", menu=alpha_menu)
     menu.add_checkbutton(label="Always on top", variable=top_var, command=set_top)
     menu.add_separator()
+    src_var = tk.StringVar(value=SOURCE_LANG)
+    tgt_var = tk.StringVar(value=TARGET_LANG)
+
+    def set_langs():
+        global SOURCE_LANG, TARGET_LANG
+        SOURCE_LANG, TARGET_LANG = src_var.get(), tgt_var.get()
+        state["source_lang"], state["target_lang"] = SOURCE_LANG, TARGET_LANG
+        engine._context = []              # old context is in another language
+        save_settings()
+
+    src_menu = paint(tk.Menu(menu, tearoff=0, bd=0, font=(UI, 9)), **MENU_COLORS)
+    for code, name in SOURCE_LANGS.items():
+        src_menu.add_radiobutton(label=name, value=code, variable=src_var, command=set_langs)
+    tgt_menu = paint(tk.Menu(menu, tearoff=0, bd=0, font=(UI, 9)), **MENU_COLORS)
+    for code, name in TARGET_LANGS.items():
+        tgt_menu.add_radiobutton(label=name, value=code, variable=tgt_var, command=set_langs)
+    menu.add_cascade(label="Audio language", menu=src_menu)
+    menu.add_cascade(label="Translate to", menu=tgt_menu)
+    menu.add_separator()
     uncensored_var = tk.BooleanVar(value=bool(state.get("uncensored")))
 
     def set_uncensored():
@@ -1642,7 +1734,7 @@ def run_ui():
         apply_fonts()
         save_settings()
 
-    menu.add_checkbutton(label="Show romaji", variable=ro_var, command=set_romaji)
+    menu.add_checkbutton(label="Show romanization", variable=ro_var, command=set_romaji)
     gender_var = tk.BooleanVar(value=bool(state.get("gender", True)))
 
     def set_gender():
@@ -1678,7 +1770,8 @@ def run_ui():
         "gemini": [("api_key", "API key", True), ("model", "Model", False)],
         "microsoft": [], "google": [],
     }
-    SAMPLE_JA = "お疲れ様です。今日は本当にありがとう。"
+    SAMPLES = {"ja": "お疲れ様です。今日は本当にありがとう。", "ko": "수고했어요. 오늘 정말 고마워요.",
+               "zh": "辛苦了。今天真的谢谢你。", "en": "Good job today. Thank you so much."}
 
     def open_translation_dialog():
         import copy
@@ -1875,7 +1968,7 @@ def run_ui():
             def work_thread():
                 t0 = time.time()
                 try:
-                    out = engine.translate_with(pid, p, SAMPLE_JA)
+                    out = engine.translate_with(pid, p, SAMPLES.get(engine.src(), SAMPLES["ja"]))
                     msg, col = f"✓ {out}   ({time.time() - t0:.1f}s)", C["ok"]
                 except Exception as e:
                     code = getattr(getattr(e, "response", None), "status_code", None)
@@ -2058,7 +2151,13 @@ def run_ui():
             n = len(history)
             count = f"{wait} queued" if wait else f"{n} line{'s' if n != 1 else ''}"
             svc = engine.last_service or engine.primary_service() or "MT"
-            foot_right.config(text=f"{count}  ·  {svc}  ·  {'GPU' if engine.device == 'cuda' else 'CPU'}")
+            count = f"{wait}⏳" if wait else str(n)
+            pair = f"{engine.src().upper()}→{TARGET_LANG.split('-')[0].upper()}"
+            cpu = "  ·  CPU" if engine.device != "cuda" else ""       # only flag the slow case
+            foot_right.config(text=f"{count}  ·  {pair}  ·  {svc}{cpu}")
+        src_label = engine.src().upper()
+        if ja_btn.cget("text") != src_label:
+            ja_btn.config(text=src_label)
 
         note_text = engine.gemini_note
         if state.get("romaji", True) and _ROMAJI["error"]:
