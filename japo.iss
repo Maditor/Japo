@@ -32,11 +32,13 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 [Files]
 ; App files (model, keys and personal settings excluded; the model downloads on first run)
 Source: "dist\Japo\*"; DestDir: "{app}"; \
-  Excludes: "model,cloudflare.txt,gemini_key.txt,japo_settings.json,japo_log.txt"; \
+  Excludes: "model,cloudflare.txt,gemini_key.txt,ai_custom.json,translators.json,japo_settings.json,japo_log.txt"; \
   Flags: ignoreversion recursesubdirs createallsubdirs
 ; API keys: included only if present, never overwrite existing ones
 Source: "cloudflare.txt"; DestDir: "{app}"; Flags: skipifsourcedoesntexist onlyifdoesntexist
 Source: "gemini_key.txt"; DestDir: "{app}"; Flags: skipifsourcedoesntexist onlyifdoesntexist
+Source: "ai_custom.json"; DestDir: "{app}"; Flags: skipifsourcedoesntexist onlyifdoesntexist
+Source: "translators.json"; DestDir: "{app}"; Flags: skipifsourcedoesntexist onlyifdoesntexist
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\Japo.exe"

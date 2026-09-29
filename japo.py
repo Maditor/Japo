@@ -228,6 +228,21 @@ def read_cloudflare():
     return None
 
 
+def read_custom_ai():
+    """ai_custom.json: {"base_url", "api_key", "model"} for any OpenAI-compatible service
+    (Groq, OpenRouter, a local server...)."""
+    import json
+    try:
+        with open(os.path.join(APP_DIR, "ai_custom.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("base_url") and d.get("model"):
+            return {"base_url": d["base_url"].rstrip("/"), "api_key": d.get("api_key", ""),
+                    "model": d["model"], "name": d.get("name") or "Custom"}
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def read_gemini_key():
     p = os.path.join(APP_DIR, "gemini_key.txt")
     try:
@@ -236,6 +251,93 @@ def read_gemini_key():
         return key or None
     except OSError:
         return None
+
+
+# ============================ TRANSLATION PROVIDERS ============================
+# id, display name, kind ("llm" = AI with context, "mt" = classic machine translation)
+PROVIDERS = [
+    ("cloudflare", "Cloudflare Workers AI", "llm"),
+    ("groq", "Groq", "llm"),
+    ("openrouter", "OpenRouter", "llm"),
+    ("custom", "Custom (OpenAI-compatible)", "llm"),
+    ("gemini", "Google Gemini", "llm"),
+    ("microsoft", "Microsoft Translator", "mt"),
+    ("google", "Google Translate", "mt"),
+]
+PROVIDER_NAMES = {p[0]: p[1] for p in PROVIDERS}
+SHORT_NAMES = {"cloudflare": "Cloudflare", "groq": "Groq", "openrouter": "OpenRouter",
+               "custom": "Custom", "gemini": "Gemini", "microsoft": "Microsoft", "google": "Google"}
+OPENAI_BASE = {"groq": "https://api.groq.com/openai/v1", "openrouter": "https://openrouter.ai/api/v1"}
+TRANSLATORS_FILE = "translators.json"
+
+
+def default_translators():
+    return {
+        "order": [p[0] for p in PROVIDERS],
+        "enabled": {p[0]: True for p in PROVIDERS},
+        "providers": {
+            "cloudflare": {"account_id": "", "api_token": "", "model": CLOUDFLARE_MODEL},
+            "groq": {"api_key": "", "model": ""},
+            "openrouter": {"api_key": "", "model": ""},
+            "custom": {"name": "Custom", "base_url": "", "api_key": "", "model": ""},
+            "gemini": {"api_key": "", "model": GEMINI_MODEL},
+            "microsoft": {}, "google": {},
+        },
+    }
+
+
+def load_translators():
+    """translators.json (created from the older cloudflare.txt / gemini_key.txt / ai_custom.json)."""
+    import json
+    cfg = default_translators()
+    path = os.path.join(APP_DIR, TRANSLATORS_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        order = [p for p in data.get("order", []) if p in PROVIDER_NAMES]
+        cfg["order"] = order + [p for p in cfg["order"] if p not in order]
+        cfg["enabled"].update({k: bool(v) for k, v in data.get("enabled", {}).items() if k in PROVIDER_NAMES})
+        for pid, vals in data.get("providers", {}).items():
+            if pid in cfg["providers"] and isinstance(vals, dict):
+                cfg["providers"][pid].update({k: str(v) for k, v in vals.items()})
+        return cfg
+    except (OSError, ValueError):
+        pass
+    # first run with this version: import the old key files
+    cf = read_cloudflare()
+    if cf:
+        cfg["providers"]["cloudflare"].update(account_id=cf[0], api_token=cf[1])
+    gm = read_gemini_key()
+    if gm:
+        cfg["providers"]["gemini"]["api_key"] = gm
+    cu = read_custom_ai()
+    if cu:
+        pid = {v: k for k, v in OPENAI_BASE.items()}.get(cu["base_url"], "custom")
+        vals = {"api_key": cu["api_key"], "model": cu["model"]}
+        if pid == "custom":
+            vals.update(name=cu["name"], base_url=cu["base_url"])
+        cfg["providers"][pid].update(vals)
+    return cfg
+
+
+def save_translators(cfg):
+    import json
+    with open(os.path.join(APP_DIR, TRANSLATORS_FILE), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=1)
+
+
+def provider_ready(pid, cfg):
+    """Does this provider have everything it needs to run?"""
+    p = cfg["providers"].get(pid, {})
+    if pid == "cloudflare":
+        return bool(p.get("account_id") and p.get("api_token"))
+    if pid in ("groq", "openrouter"):
+        return bool(p.get("api_key") and p.get("model"))
+    if pid == "custom":
+        return bool(p.get("base_url") and p.get("model"))
+    if pid == "gemini":
+        return bool(p.get("api_key"))
+    return True        # microsoft / google need nothing
 
 
 def add_cuda_dll_paths():
@@ -337,8 +439,9 @@ class SubtitleEngine:
         self.model = None
         self.device = DEVICE
         self.capture = None
-        self.gemini_key = None
-        self.cloudflare = None
+        self.tcfg = default_translators()   # translation providers (see translators.json)
+        self.ai_cooldown = {}     # provider -> timestamp until which it is skipped
+        self.last_service = None  # which translator produced the last line
         self.gemini_note = None   # translation warning shown in the status area
         self.uncensored = False
         self.detect_gender = True
@@ -379,8 +482,7 @@ class SubtitleEngine:
 
     def _init_and_run(self):
         try:
-            self.gemini_key = read_gemini_key()
-            self.cloudflare = read_cloudflare()
+            self.tcfg = load_translators()
             self.load_model()
             self.capture = LoopbackCapture(self.audio_q)
             self.capture.start()
@@ -393,8 +495,7 @@ class SubtitleEngine:
         threading.Thread(target=self._transcriber, daemon=True).start()
         threading.Thread(target=self._translator_loop, daemon=True).start()
         self.listening = True
-        tr = ("Cloudflare Gemma" if self.cloudflare
-              else "Gemini" if self.gemini_key else "machine translation")
+        tr = self.primary_service() or "machine translation"
         self.status(f"Listening: {self.capture.device['name']} | {self.device.upper()} | {tr}")
 
     def _segmenter(self):
@@ -555,15 +656,19 @@ class SubtitleEngine:
                 self._pool = ThreadPoolExecutor(max_workers=2)
             en_future = self._pool.submit(self.machine_translate, text, "en")
         vi = None
-        ais = []
-        if self.cloudflare:
-            ais.append(("Cloudflare", self._translate_cloudflare))
-        if self.gemini_key:
-            ais.append(("Gemini", self._translate_gemini))
         notes = []
-        for name, fn in ais:
+        cfg = self.tcfg
+        for pid in cfg["order"]:
+            if not cfg["enabled"].get(pid, True) or not provider_ready(pid, cfg):
+                continue
+            name = self.service_name(pid)
+            until = self.ai_cooldown.get(pid, 0)
+            if until > now:
+                notes.append(f"{name} paused until {time.strftime('%H:%M', time.localtime(until))}")
+                continue
             try:
-                vi = fn(text, gender)
+                vi = self.translate_with(pid, cfg["providers"][pid], text, gender)
+                self.last_service = name
                 break
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
@@ -573,10 +678,16 @@ class SubtitleEngine:
                 except Exception:
                     pass
                 print(f"{name} ERROR:", code or "", e, detail, flush=True)
-                notes.append(f"{name} error ({code or type(e).__name__})")
+                self.ai_cooldown[pid] = now + self._cooldown_for(pid, code, detail)
+                if self.ai_cooldown[pid] - now >= 3600:
+                    notes.append(f"{name} quota used up, paused until "
+                                 f"{time.strftime('%H:%M', time.localtime(self.ai_cooldown[pid]))}")
+                else:
+                    notes.append(f"{name} error ({code or type(e).__name__})")
         self.gemini_note = (", ".join(notes) + ("; using machine translation" if not vi else "")) if notes else None
-        if not vi:
+        if not vi:                       # last resort: any machine translator that still works
             vi = self.machine_translate(text, TARGET_LANG)
+            self.last_service = "MT"
         en = None
         if en_future is not None:
             try:
@@ -659,9 +770,38 @@ Mode: uncensored. The dialogue may contain mature language.
             return as_text(res.get("response")) or as_text(res.get("output_text"))
         return as_text(res)
 
-    def _translate_cloudflare(self, text, gender=None):
+    def service_name(self, pid):
+        if pid == "custom":
+            return self.tcfg["providers"]["custom"].get("name") or "Custom"
+        return SHORT_NAMES.get(pid, pid)
+
+    def primary_service(self):
+        for pid in self.tcfg["order"]:
+            if self.tcfg["enabled"].get(pid, True) and provider_ready(pid, self.tcfg):
+                return self.service_name(pid)
+        return None
+
+    def translate_with(self, pid, p, text, gender=None):
+        """Translate one line with a single provider (raises on failure)."""
+        if pid == "cloudflare":
+            return self._translate_cloudflare(p, text, gender)
+        if pid in ("groq", "openrouter", "custom"):
+            base = OPENAI_BASE.get(pid) or p.get("base_url", "")
+            return self._translate_openai(pid, base, p, text, gender)
+        if pid == "gemini":
+            return self._translate_gemini(p, text, gender)
+        if pid == "microsoft":
+            return self._translate_edge(text, TARGET_LANG)
+        if pid == "google":
+            try:
+                return self._translate_google(text, TARGET_LANG)
+            except Exception:
+                return self._translate_gtx(text, TARGET_LANG)
+        raise RuntimeError(f"Unknown provider {pid}")
+
+    def _translate_cloudflare(self, p, text, gender=None):
         import requests, json as _json
-        acc, tok = self.cloudflare
+        acc, tok = p["account_id"], p["api_token"]
         _, prompt = self._llm_prompt(text, gender)
         url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {tok}"}
@@ -669,7 +809,7 @@ Mode: uncensored. The dialogue may contain mature language.
         extra = {} if getattr(self, "_cf_no_kwargs", False) else \
             {"chat_template_kwargs": {"enable_thinking": False}}
         for attempt in range(3):
-            body = {"model": CLOUDFLARE_MODEL, "temperature": 0.5, "max_tokens": 512,
+            body = {"model": p.get("model") or CLOUDFLARE_MODEL, "temperature": 0.5, "max_tokens": 512,
                     "messages": [{"role": "user", "content": prompt}], **extra}
             r = requests.post(url, headers=headers, json=body, timeout=30)
             if r.status_code == 400 and extra and \
@@ -690,7 +830,56 @@ Mode: uncensored. The dialogue may contain mature language.
         r.raise_for_status()
         raise RuntimeError("Cloudflare not responding")
 
-    def _translate_gemini(self, text, gender=None):
+    @staticmethod
+    def _cooldown_for(name, code, detail):
+        """How long to skip a provider after an error (seconds)."""
+        d = (detail or "").lower()
+        quota = any(w in d for w in ("allocation", "neurons", "quota", "exceeded", "4006",
+                                     "resource_exhausted", "limit reached", "daily"))
+        if quota:
+            if name == "cloudflare":          # free allocation resets at 00:00 UTC
+                t = time.gmtime()
+                return max(600, 86400 - (t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec) + 60)
+            return 3600
+        if code in (401, 403):
+            return 3600                       # bad key: don't hammer it
+        if code == 429:
+            return 120                        # short rate limit
+        if code and code >= 500:
+            return 60
+        return 20                             # network hiccup
+
+    def _translate_openai(self, pid, base, p, text, gender=None):
+        """Any OpenAI-compatible endpoint (Groq, OpenRouter, LM Studio, Ollama...)."""
+        import requests
+        _, prompt = self._llm_prompt(text, gender)
+        headers = {"Content-Type": "application/json"}
+        if p.get("api_key"):
+            headers["Authorization"] = f"Bearer {p['api_key']}"
+        if pid == "openrouter":
+            headers.update({"HTTP-Referer": "https://github.com/Maditor/Japo", "X-Title": "Japo"})
+        r = requests.post(f"{base.rstrip('/')}/chat/completions", headers=headers, timeout=30,
+                          json={"model": p["model"], "temperature": 0.5, "max_tokens": 512,
+                                "messages": [{"role": "user", "content": prompt}]})
+        r.raise_for_status()
+        out = self._clean_llm(self._extract_text(r.json()))
+        if not out:
+            raise RuntimeError(f"{self.service_name(pid)} returned empty")
+        return out
+
+    @staticmethod
+    def list_models(pid, p):
+        """Model ids offered by an OpenAI-compatible provider (GET /models)."""
+        import requests
+        base = OPENAI_BASE.get(pid) or p.get("base_url", "")
+        headers = {"Authorization": f"Bearer {p['api_key']}"} if p.get("api_key") else {}
+        r = requests.get(f"{base.rstrip('/')}/models", headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("data", data) if isinstance(data, dict) else data
+        return sorted({(m.get("id") if isinstance(m, dict) else str(m)) for m in items} - {None})
+
+    def _translate_gemini(self, p, text, gender=None):
         import requests
         system, prompt = self._llm_prompt(text, gender)
         body = {
@@ -704,8 +893,8 @@ Mode: uncensored. The dialogue may contain mature language.
             ],
         }
         r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-            params={"key": self.gemini_key}, json=body, timeout=15,
+            f"https://generativelanguage.googleapis.com/v1beta/models/{p.get('model') or GEMINI_MODEL}:generateContent",
+            params={"key": p["api_key"]}, json=body, timeout=15,
         )
         r.raise_for_status()
         data = r.json()
@@ -1462,144 +1651,334 @@ def run_ui():
 
     menu.add_checkbutton(label="Detect speaker gender", variable=gender_var, command=set_gender)
     menu.add_separator()
-    # ---------------------------------------------------------------- API keys dialog
-    def open_api_dialog():
-        if getattr(open_api_dialog, "win", None) and open_api_dialog.win.winfo_exists():
-            open_api_dialog.win.lift()
+    # ---------------------------------------------------------------- Translation dialog
+    PROVIDER_INFO = {
+        "cloudflare": ("Gemma 4 on Workers AI. Best quality in Japo, free daily allowance.",
+                       "https://dash.cloudflare.com/profile/api-tokens", "Create a token (Workers AI template)"),
+        "groq": ("Very fast LLM hosting with a free tier (rate limited).",
+                 "https://console.groq.com/keys", "Get an API key"),
+        "openrouter": ("Hundreds of models. Models ending in “:free” cost nothing.",
+                       "https://openrouter.ai/keys", "Get an API key"),
+        "custom": ("Any OpenAI-compatible server, e.g. LM Studio (http://localhost:1234/v1) "
+                   "or Ollama (http://localhost:11434/v1).", None, None),
+        "gemini": ("Google's Gemini API. Free tier with daily limits.",
+                   "https://aistudio.google.com/apikey", "Get an API key"),
+        "microsoft": ("Free, no key needed. Fast, but translates line by line without context.",
+                      None, None),
+        "google": ("Free, no key needed. Fast, but translates line by line without context.",
+                   None, None),
+    }
+    PROVIDER_FIELDS = {
+        "cloudflare": [("account_id", "Account ID", False), ("api_token", "API token", True),
+                       ("model", "Model", False)],
+        "groq": [("api_key", "API key", True), ("model", "Model", False)],
+        "openrouter": [("api_key", "API key", True), ("model", "Model", False)],
+        "custom": [("name", "Display name", False), ("base_url", "Base URL", False),
+                   ("api_key", "API key (optional)", True), ("model", "Model", False)],
+        "gemini": [("api_key", "API key", True), ("model", "Model", False)],
+        "microsoft": [], "google": [],
+    }
+    SAMPLE_JA = "お疲れ様です。今日は本当にありがとう。"
+
+    def open_translation_dialog():
+        import copy
+        if getattr(open_translation_dialog, "win", None) and open_translation_dialog.win.winfo_exists():
+            open_translation_dialog.win.lift()
             return
-        cf = read_cloudflare() or ("", "")
-        gm = read_gemini_key() or ""
+        work = copy.deepcopy(engine.tcfg)
+        ui = {"sel": work["order"][0], "entries": {}}
 
         win = tk.Toplevel(root)
-        open_api_dialog.win = win
-        win.title("API keys")
+        open_translation_dialog.win = win
+        win.title("Translation")
         win.configure(bg=C["bg"])
-        win.resizable(False, False)
         win.transient(root)
         win.attributes("-topmost", True)
+        win.resizable(False, False)
         pad = px(16)
 
-        def label(parent, text, small=False):
-            return tk.Label(parent, text=text, bg=C["bg"], fg=C["muted"] if small else C["text"],
-                            font=(UI, 8 if small else 9, "normal" if small else "bold"),
-                            anchor="w", justify="left")
+        def lbl(parent, text, size=9, bold=False, fg="text", bg="bg", **kw):
+            return tk.Label(parent, text=text, bg=C[bg], fg=C[fg], anchor="w", justify="left",
+                            font=(UI, size, "bold" if bold else "normal"), **kw)
 
-        def entry(parent, value, secret=False):
-            e = tk.Entry(parent, font=(UI, 9), relief="flat", bd=0, highlightthickness=1,
-                         bg=C["surface"], fg=C["text"], insertbackground=C["text"],
-                         highlightbackground=C["border"], highlightcolor=C["accent"],
-                         show="•" if secret else "", width=42)
-            e.insert(0, value)
-            return e
-
-        body_f = tk.Frame(win, bg=C["bg"])
-        body_f.pack(fill="both", padx=pad, pady=(pad, px(8)))
-
-        label(body_f, "Cloudflare Workers AI").pack(fill="x")
-        label(body_f, "Used for AI translation (Gemma). Create a token with the “Workers AI” template.",
-              small=True).pack(fill="x", pady=(0, px(8)))
-
-        label(body_f, "Account ID", small=True).pack(fill="x")
-        acc_e = entry(body_f, cf[0])
-        acc_e.pack(fill="x", ipady=px(4), pady=(px(2), px(8)))
-
-        label(body_f, "API token", small=True).pack(fill="x")
-        tok_row = tk.Frame(body_f, bg=C["bg"])
-        tok_row.pack(fill="x", pady=(px(2), px(4)))
-        tok_e = entry(tok_row, cf[1], secret=True)
-        tok_e.pack(side="left", fill="x", expand=True, ipady=px(4))
-
-        def toggle_show():
-            tok_e.config(show="" if tok_e.cget("show") else "•")
-            gem_e.config(show="" if gem_e.cget("show") else "•")
-        show_btn = tk.Label(tok_row, text="Show", bg=C["surface"], fg=C["text"], font=(UI, 8),
-                            padx=px(8), pady=px(4), cursor="hand2")
-        show_btn.pack(side="left", padx=(px(6), 0))
-        show_btn.bind("<Button-1>", lambda e: toggle_show())
-
-        link = tk.Label(body_f, text="Get a token →", bg=C["bg"], fg=C["en"], font=(UI, 8, "underline"),
-                        cursor="hand2", anchor="w")
-        link.pack(fill="x", pady=(0, px(12)))
-        link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
-            "https://dash.cloudflare.com/profile/api-tokens"))
-
-        label(body_f, "Gemini (optional)").pack(fill="x")
-        label(body_f, "Fallback when Cloudflare is unavailable.", small=True).pack(fill="x", pady=(0, px(6)))
-        gem_e = entry(body_f, gm, secret=True)
-        gem_e.pack(fill="x", ipady=px(4), pady=(0, px(4)))
-
-        status_l = label(body_f, "", small=True)
-        status_l.pack(fill="x", pady=(px(8), 0))
-
-        btns = tk.Frame(win, bg=C["bg"])
-        btns.pack(fill="x", padx=pad, pady=(0, pad))
-
-        def mk_btn(text, cmd, primary=False):
-            b = tk.Label(btns, text=text, font=(UI, 9, "bold" if primary else "normal"),
+        def flat_btn(parent, text, cmd, primary=False, small=False):
+            b = tk.Label(parent, text=text, cursor="hand2",
+                         font=(UI, 8 if small else 9, "bold" if primary else "normal"),
                          bg=C["accent"] if primary else C["surface"],
                          fg="#ffffff" if primary else C["text"],
-                         padx=px(14), pady=px(6), cursor="hand2")
+                         padx=px(8 if small else 14), pady=px(3 if small else 6))
+            base_bg = b.cget("bg")
+            b.bind("<Enter>", lambda e: b.config(bg=C["hover"]) if not primary else None)
+            b.bind("<Leave>", lambda e: b.config(bg=base_bg))
             b.bind("<Button-1>", lambda e: cmd())
             return b
 
-        def write_or_remove(path, content):
-            if content.strip():
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content.strip() + "\n")
-            elif os.path.exists(path):
-                os.remove(path)
+        # ---- header
+        head = tk.Frame(win, bg=C["bg"])
+        head.pack(fill="x", padx=pad, pady=(pad, px(10)))
+        lbl(head, "Translation", 12, True).pack(fill="x")
+        lbl(head, "Japo tries the enabled services from top to bottom and moves on when one fails "
+                  "or runs out of quota.", 8, fg="muted", wraplength=px(560)).pack(fill="x", pady=(px(2), 0))
+
+        body = tk.Frame(win, bg=C["bg"])
+        body.pack(fill="both", padx=pad)
+
+        # ---- left: provider list
+        left = tk.Frame(body, bg=C["surface"], width=px(230))
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+        lbl(left, "PRIORITY", 7, True, fg="muted", bg="surface").pack(fill="x", padx=px(10), pady=(px(8), px(4)))
+        list_f = tk.Frame(left, bg=C["surface"])
+        list_f.pack(fill="both", expand=True)
+
+        # ---- right: details
+        right = tk.Frame(body, bg=C["bg"], width=px(330), height=px(330))
+        right.pack(side="left", fill="both", padx=(px(16), 0))
+        right.pack_propagate(False)
+
+        def read_entries():
+            for key, e in ui["entries"].items():
+                work["providers"][ui["sel"]][key] = e.get().strip()
+            ui["entries"] = {}
+
+        def move(pid, delta):
+            read_entries()
+            o = work["order"]
+            i = o.index(pid)
+            j = i + delta
+            if 0 <= j < len(o):
+                o[i], o[j] = o[j], o[i]
+            render_list()
+            render_detail()
+
+        def toggle(pid):
+            read_entries()
+            work["enabled"][pid] = not work["enabled"].get(pid, True)
+            render_list()
+            render_detail()
+
+        def select(pid):
+            read_entries()
+            ui["sel"] = pid
+            render_list()
+            render_detail()
+
+        def render_list():
+            for w in list_f.winfo_children():
+                w.destroy()
+            for idx, pid in enumerate(work["order"]):
+                sel = pid == ui["sel"]
+                bg = C["hover"] if sel else C["surface"]
+                row = tk.Frame(list_f, bg=bg, cursor="hand2")
+                row.pack(fill="x")
+                on = work["enabled"].get(pid, True)
+                box = tk.Label(row, text="✓" if on else "", width=2, font=(UI, 8, "bold"),
+                               bg=C["accent"] if on else C["bg"], fg="#ffffff",
+                               highlightthickness=1, highlightbackground=C["border"], cursor="hand2")
+                box.pack(side="left", padx=(px(10), px(8)), pady=px(8))
+                box.bind("<Button-1>", lambda e, p=pid: toggle(p))
+                ready = provider_ready(pid, work)
+                name = (work["providers"]["custom"].get("name") or "Custom") if pid == "custom" else SHORT_NAMES[pid]
+                nl = tk.Label(row, text=f"{idx + 1}. {name}", bg=bg,
+                              fg=C["text"] if on else C["faint"], font=(UI, 9, "bold" if sel else "normal"),
+                              anchor="w")
+                nl.pack(side="left", fill="x", expand=True)
+                dot = tk.Label(row, text="●", bg=bg, font=(UI, 8),
+                               fg=C["ok"] if ready else C["faint"])
+                dot.pack(side="left", padx=(0, px(4)))
+                for arrow, d in (("▲", -1), ("▼", 1)):
+                    a = tk.Label(row, text=arrow, bg=bg, fg=C["muted"], font=(UI, 7), cursor="hand2",
+                                 padx=px(3))
+                    a.pack(side="left")
+                    a.bind("<Button-1>", lambda e, p=pid, d=d: move(p, d))
+                tk.Frame(row, bg=bg, width=px(6)).pack(side="left")
+                for w in (row, nl, dot):
+                    w.bind("<Button-1>", lambda e, p=pid: select(p))
+            legend = tk.Frame(list_f, bg=C["surface"])
+            legend.pack(fill="x", side="bottom", pady=px(8))
+            lbl(legend, "●", 8, fg="ok", bg="surface").pack(side="left", padx=(px(10), px(2)))
+            lbl(legend, "ready", 8, fg="muted", bg="surface").pack(side="left")
+            lbl(legend, "●", 8, fg="faint", bg="surface").pack(side="left", padx=(px(10), px(2)))
+            lbl(legend, "needs setup", 8, fg="muted", bg="surface").pack(side="left")
+
+        def browse_models(pid):
+            read_entries()
+            p = work["providers"][pid]
+            status.config(text="Loading models…", fg=C["muted"])
+
+            def work_thread():
+                try:
+                    models = engine.list_models(pid, p)
+                    root.after(0, lambda: show_models(pid, models))
+                except Exception as e:
+                    msg = f"Could not load models: {getattr(getattr(e, 'response', None), 'status_code', '') or type(e).__name__}"
+                    root.after(0, lambda: status.winfo_exists() and status.config(text=msg, fg=C["err"]))
+            threading.Thread(target=work_thread, daemon=True).start()
+
+        def show_models(pid, models):
+            if not win.winfo_exists():
+                return
+            status.config(text=f"{len(models)} models", fg=C["muted"])
+            pop = tk.Toplevel(win)
+            pop.title("Choose a model")
+            pop.configure(bg=C["bg"])
+            pop.transient(win)
+            pop.attributes("-topmost", True)
+            q = tk.Entry(pop, font=(UI, 9), relief="flat", bg=C["surface"], fg=C["text"],
+                         insertbackground=C["text"], highlightthickness=1,
+                         highlightbackground=C["border"], highlightcolor=C["accent"])
+            q.pack(fill="x", padx=px(10), pady=(px(10), px(6)), ipady=px(4))
+            free_var = tk.BooleanVar(value=pid == "openrouter")
+            if pid == "openrouter":
+                tk.Checkbutton(pop, text="Free models only", variable=free_var, bg=C["bg"], fg=C["text"],
+                               selectcolor=C["surface"], activebackground=C["bg"], activeforeground=C["text"],
+                               font=(UI, 8), command=lambda: fill()).pack(anchor="w", padx=px(8))
+            lb = tk.Listbox(pop, font=(UI, 9), bg=C["surface"], fg=C["text"], relief="flat", bd=0,
+                            selectbackground=C["accent"], selectforeground="#ffffff",
+                            highlightthickness=0, width=46, height=14, activestyle="none")
+            lb.pack(fill="both", expand=True, padx=px(10), pady=(px(4), px(10)))
+
+            def fill(*_):
+                lb.delete(0, "end")
+                term = q.get().strip().lower()
+                for m in models:
+                    if term and term not in m.lower():
+                        continue
+                    if free_var.get() and not m.endswith(":free"):
+                        continue
+                    lb.insert("end", m)
+
+            def pick(*_):
+                if lb.curselection():
+                    work["providers"][pid]["model"] = lb.get(lb.curselection()[0])
+                    pop.destroy()
+                    render_list()
+                    render_detail()
+            q.bind("<KeyRelease>", fill)
+            lb.bind("<Double-Button-1>", pick)
+            lb.bind("<Return>", pick)
+            fill()
+            q.focus_set()
+            pop.geometry(f"+{win.winfo_rootx() + px(60)}+{win.winfo_rooty() + px(60)}")
+
+        def run_test():
+            read_entries()
+            pid = ui["sel"]
+            p = copy.deepcopy(work["providers"][pid])
+            if not provider_ready(pid, work):
+                status.config(text="Fill in the required fields first.", fg=C["warn"])
+                render_detail()
+                return
+            status.config(text="Testing…", fg=C["muted"])
+            render_detail(keep_status=True)
+
+            def work_thread():
+                t0 = time.time()
+                try:
+                    out = engine.translate_with(pid, p, SAMPLE_JA)
+                    msg, col = f"✓ {out}   ({time.time() - t0:.1f}s)", C["ok"]
+                except Exception as e:
+                    code = getattr(getattr(e, "response", None), "status_code", None)
+                    msg, col = f"✗ {code or ''} {type(e).__name__}: {str(e)[:80]}", C["err"]
+                root.after(0, lambda: status.winfo_exists() and status.config(text=msg, fg=col))
+            threading.Thread(target=work_thread, daemon=True).start()
+
+        status_holder = {"text": "", "fg": None}
+
+        def render_detail(keep_status=False):
+            if not keep_status:
+                status_holder["text"] = ""
+            for w in right.winfo_children():
+                w.destroy()
+            ui["entries"] = {}
+            pid = ui["sel"]
+            p = work["providers"][pid]
+            desc, link, link_text = PROVIDER_INFO[pid]
+            lbl(right, PROVIDER_NAMES[pid], 11, True).pack(fill="x")
+            lbl(right, desc, 8, fg="muted", wraplength=px(320)).pack(fill="x", pady=(px(2), px(4)))
+            if link:
+                a = lbl(right, f"{link_text} →", 8, fg="en", cursor="hand2")
+                a.config(font=(UI, 8, "underline"))
+                a.pack(fill="x", pady=(0, px(6)))
+                a.bind("<Button-1>", lambda e, u=link: __import__("webbrowser").open(u))
+            if not work["enabled"].get(pid, True):
+                lbl(right, "Disabled – tick the box on the left to use it.", 8, fg="warn").pack(fill="x")
+            for key, title, secret in PROVIDER_FIELDS[pid]:
+                lbl(right, title, 8, fg="muted").pack(fill="x", pady=(px(6), px(2)))
+                rowf = tk.Frame(right, bg=C["bg"])
+                rowf.pack(fill="x")
+                e = tk.Entry(rowf, font=(UI, 9), relief="flat", bd=0, highlightthickness=1,
+                             bg=C["surface"], fg=C["text"], insertbackground=C["text"],
+                             highlightbackground=C["border"], highlightcolor=C["accent"],
+                             show="•" if secret else "")
+                e.insert(0, p.get(key, ""))
+                e.pack(side="left", fill="x", expand=True, ipady=px(4))
+                ui["entries"][key] = e
+                if secret:
+                    def flip(ent=e, holder=None):
+                        ent.config(show="" if ent.cget("show") else "•")
+                    flat_btn(rowf, "Show", flip, small=True).pack(side="left", padx=(px(6), 0))
+                if key == "model" and pid in ("groq", "openrouter", "custom"):
+                    flat_btn(rowf, "Browse…", lambda p=pid: browse_models(p), small=True).pack(
+                        side="left", padx=(px(6), 0))
+                e.bind("<KeyRelease>", lambda ev: (read_entries_keep(), render_list()))
+            if pid in ("microsoft", "google"):
+                lbl(right, "Nothing to configure.", 9, fg="muted").pack(fill="x", pady=(px(12), 0))
+            test_row = tk.Frame(right, bg=C["bg"])
+            test_row.pack(fill="x", pady=(px(14), px(4)))
+            flat_btn(test_row, "Test translation", run_test).pack(side="left")
+            global_status = lbl(right, status_holder["text"], 8, fg="muted", wraplength=px(320))
+            global_status.pack(fill="x")
+            nonlocal_status["w"] = global_status
+
+        nonlocal_status = {"w": None}
+
+        def read_entries_keep():
+            for key, e in ui["entries"].items():
+                work["providers"][ui["sel"]][key] = e.get().strip()
+
+        class _StatusProxy:
+            def config(self, **kw):
+                w = nonlocal_status["w"]
+                if "text" in kw:
+                    status_holder["text"] = kw["text"]
+                if w is not None and w.winfo_exists():
+                    w.config(**kw)
+
+            def winfo_exists(self):
+                return win.winfo_exists()
+        status = _StatusProxy()
+
+        # ---- footer
+        foot = tk.Frame(win, bg=C["bg"])
+        foot.pack(fill="x", padx=pad, pady=pad)
+        lbl(foot, "Keys are stored in translators.json next to Japo.", 8, fg="faint").pack(side="left")
 
         def save():
-            acc, tok, gem = acc_e.get().strip(), tok_e.get().strip(), gem_e.get().strip()
-            if tok.lower().startswith("bearer "):
-                tok = tok[7:].strip()
-            if bool(acc) != bool(tok):
-                status_l.config(text="Please fill in both Account ID and API token.", fg=C["warn"])
-                return
+            read_entries()
             try:
-                write_or_remove(os.path.join(APP_DIR, "cloudflare.txt"), f"{acc}\n{tok}" if acc else "")
-                write_or_remove(os.path.join(APP_DIR, "gemini_key.txt"), gem)
+                save_translators(work)
             except OSError as e:
-                status_l.config(text=f"Could not save: {e}", fg=C["err"])
+                status.config(text=f"Could not save: {e}", fg=C["err"])
                 return
-            engine.cloudflare = read_cloudflare()
-            engine.gemini_key = read_gemini_key()
+            engine.tcfg = load_translators()
+            engine.ai_cooldown.clear()
             engine.gemini_note = None
+            engine.last_service = None
             win.destroy()
 
-        def test():
-            acc, tok = acc_e.get().strip(), tok_e.get().strip()
-            if not tok:
-                status_l.config(text="Enter an API token first.", fg=C["warn"])
-                return
-            status_l.config(text="Testing…", fg=C["muted"])
-
-            def work():
-                try:
-                    import requests
-                    r = requests.get("https://api.cloudflare.com/client/v4/user/tokens/verify",
-                                     headers={"Authorization": f"Bearer {tok}"}, timeout=10)
-                    ok = r.ok and r.json().get("result", {}).get("status") == "active"
-                    msg = ("Token is valid ✓", C["ok"]) if ok else ("Invalid token", C["err"])
-                except Exception as e:
-                    msg = (f"Could not connect: {type(e).__name__}", C["err"])
-                root.after(0, lambda: status_l.winfo_exists() and status_l.config(text=msg[0], fg=msg[1]))
-            threading.Thread(target=work, daemon=True).start()
-
-        mk_btn("Save", save, primary=True).pack(side="right")
-        mk_btn("Cancel", win.destroy).pack(side="right", padx=(0, px(8)))
-        mk_btn("Test", test).pack(side="left")
-
-        win.bind("<Return>", lambda e: save())
+        flat_btn(foot, "Save", save, primary=True).pack(side="right")
+        flat_btn(foot, "Cancel", win.destroy).pack(side="right", padx=(0, px(8)))
         win.bind("<Escape>", lambda e: win.destroy())
+
+        render_list()
+        render_detail()
         win.update_idletasks()
         x = root.winfo_rootx() + (root.winfo_width() - win.winfo_width()) // 2
-        y = root.winfo_rooty() + px(60)
         x = min(x, root.winfo_screenwidth() - win.winfo_width() - px(8))
-        win.geometry(f"+{max(0, x)}+{max(0, y)}")
-        acc_e.focus_set()
+        win.geometry(f"+{max(0, x)}+{max(0, root.winfo_rooty() + px(40))}")
 
-    menu.add_command(label="API keys…", command=open_api_dialog)
+    menu.add_command(label="Translation & API keys…", command=open_translation_dialog)
     menu.add_command(label="Save subtitles (.txt)…", command=save_txt)
     menu.add_command(label="Open Japo folder", command=lambda: os.startfile(APP_DIR)
                      if os.name == "nt" else None)
@@ -1678,7 +2057,8 @@ def run_ui():
             wait = engine.seg_q.qsize() + engine.tr_q.qsize()
             n = len(history)
             count = f"{wait} queued" if wait else f"{n} line{'s' if n != 1 else ''}"
-            foot_right.config(text=f"{count}  ·  {'GPU' if engine.device == 'cuda' else 'CPU'}")
+            svc = engine.last_service or engine.primary_service() or "MT"
+            foot_right.config(text=f"{count}  ·  {svc}  ·  {'GPU' if engine.device == 'cuda' else 'CPU'}")
 
         note_text = engine.gemini_note
         if state.get("romaji", True) and _ROMAJI["error"]:

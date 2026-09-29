@@ -54,19 +54,32 @@ Cài xong **đóng cmd, mở lại** rồi gõ `python --version`, thấy `Pytho
 
 ---
 
-## 3. Cấu hình dịch bằng AI (Cloudflare)
+## 3. Cấu hình dịch (Translation & API keys)
 
-1. Đăng nhập [dash.cloudflare.com](https://dash.cloudflare.com) (tạo tài khoản miễn phí nếu chưa có).
-2. Lấy **Account ID**: nằm trong trang *Workers AI*, hoặc là dãy 32 ký tự trên thanh địa chỉ ngay sau `dash.cloudflare.com/`.
-3. Tạo **API Token**: vào [trang API Tokens](https://dash.cloudflare.com/profile/api-tokens) → **Create Token** → chọn mẫu **Workers AI** → tạo và copy token.
-   Chú ý: phải là **API Token**, không phải *Global API Key*.
-4. Mở Japo, bấm **⚙ → API keys…**, dán **Account ID** và **API token** vào, bấm **Test** để kiểm tra rồi bấm **Save**. Không cần khởi động lại app.
-   *(Cách thủ công: copy `cloudflare.example.txt` thành `cloudflare.txt`, dòng 1 là Account ID, dòng 2 là token.)*
-5. Bấm **Test** thấy dòng **Token is valid ✓** là đã kết nối được. Từ câu tiếp theo, Japo dịch bằng AI (Gemma).
+Mở Japo → **⚙ → Translation & API keys…**. Cửa sổ gồm 2 phần:
 
-*(Tuỳ chọn)* **Gemini:** tạo key tại [Google AI Studio](https://aistudio.google.com/apikey), rồi dán vào ô **Gemini** trong cửa sổ **API keys**.
+- **Bên trái – danh sách dịch vụ theo thứ tự ưu tiên.** Tick ô vuông để bật/tắt, dùng ▲ ▼ để đổi thứ tự. Chấm **xanh** là đã cài đủ, chấm **xám** là còn thiếu key.
+- **Bên phải – cài đặt của dịch vụ đang chọn:** key, model, link lấy key và nút **Test translation** để dịch thử một câu.
 
-> ⚠️ **Không bao giờ đưa `cloudflare.txt` hay `gemini_key.txt` lên GitHub hay gửi cho người khác.** File `.gitignore` đã chặn sẵn 2 file này.
+Japo dùng dịch vụ **đầu tiên đang bật và đã cài đủ**. Nếu dịch vụ đó lỗi hoặc hết lượt, Japo tự chuyển xuống dịch vụ tiếp theo.
+
+| Dịch vụ | Cần gì | Ghi chú |
+|---|---|---|
+| **Cloudflare Workers AI** | Account ID + API token | Dịch hay nhất (Gemma 4), có lượt miễn phí mỗi ngày |
+| **Groq** | API key + model | Rất nhanh, gói miễn phí có giới hạn tốc độ |
+| **OpenRouter** | API key + model | Nhiều model, model đuôi `:free` miễn phí |
+| **Custom** | Base URL + model | Mọi dịch vụ kiểu OpenAI, kể cả AI chạy trên máy (LM Studio, Ollama) |
+| **Google Gemini** | API key | Gói miễn phí có giới hạn theo ngày |
+| **Microsoft Translator** | Không cần | Miễn phí, nhanh, nhưng dịch từng câu, không có ngữ cảnh |
+| **Google Translate** | Không cần | Như trên |
+
+**Lấy key Cloudflare:** vào [trang API Tokens](https://dash.cloudflare.com/profile/api-tokens) → **Create Token** → mẫu **Workers AI**. Chú ý là **API Token**, không phải *Global API Key*. Account ID là dãy 32 ký tự trên thanh địa chỉ ngay sau `dash.cloudflare.com/`.
+
+**Chọn model cho Groq / OpenRouter / Custom:** dán API key rồi bấm **Browse…** để xem danh sách model và chọn (OpenRouter có ô lọc *Free models only*).
+
+**Khi hết lượt:** Cloudflare báo hết lượt miễn phí trong ngày thì Japo tạm bỏ qua nó đến lúc lượt được làm mới (7 giờ sáng giờ Việt Nam). Các dịch vụ khác bị giới hạn thì nghỉ vài phút. Nếu tất cả đều lỗi, Japo vẫn luôn còn máy dịch làm phương án cuối. Thanh dưới cùng hiện tên dịch vụ đang dùng.
+
+> ⚠️ Key được lưu trong file **`translators.json`** cạnh Japo. **Không bao giờ đưa file này lên GitHub hay gửi cho người khác.** `.gitignore` đã chặn sẵn. (Bản cũ dùng `cloudflare.txt`, `gemini_key.txt`, `ai_custom.json`: Japo tự nhập các file này ở lần mở đầu tiên.)
 
 ---
 
@@ -97,7 +110,7 @@ Cài xong **đóng cmd, mở lại** rồi gõ `python --version`, thấy `Pytho
 - **Uncensored translation:** dịch sát nghĩa, không nói giảm nói tránh
 - **Show romaji:** hiện phiên âm Latin thay cho chữ Nhật
 - **Detect speaker gender:** đoán giọng nam/nữ
-- **API keys…:** nhập Account ID, token Cloudflare và key Gemini
+- **Translation & API keys…:** chọn dịch vụ dịch, thứ tự ưu tiên và nhập key
 - **Save subtitles (.txt):** lưu toàn bộ phụ đề ra file
 - **Open Japo folder:** mở thư mục chứa app
 
@@ -147,10 +160,9 @@ Model không nằm trong bộ cài (quá nặng), app sẽ tự tải ở lần 
 | `run.bat` | Chạy Japo |
 | `build_exe.bat` | Đóng gói thành app `.exe` |
 | `build_installer.bat`, `japo.iss` | Tạo bộ cài `Japo-Setup.exe` |
-| `cloudflare.example.txt` | Mẫu file cấu hình Cloudflare |
 | `.gitignore` | Chặn file cá nhân/nặng khi đưa lên GitHub |
 
-**Tự sinh ra khi chạy (không đưa lên GitHub):** `venv\`, `model\`, `dist\`, `build\`, `Output\`, `cloudflare.txt`, `gemini_key.txt`, `japo_settings.json`, `japo_log.txt`.
+**Tự sinh ra khi chạy (không đưa lên GitHub):** `venv\`, `model\`, `dist\`, `build\`, `Output\`, `translators.json`, `japo_settings.json`, `japo_log.txt`.
 
 ---
 

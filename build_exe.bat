@@ -10,6 +10,14 @@ if not exist "venv\Scripts\python.exe" (
 )
 set PY="%~dp0venv\Scripts\python.exe"
 
+rem Close a running Japo build, otherwise its files are locked and the old build cannot be replaced
+tasklist /fi "imagename eq Japo.exe" | find /i "Japo.exe" >nul
+if not errorlevel 1 (
+  echo Japo is running - closing it before building...
+  taskkill /im Japo.exe /f >nul 2>nul
+  timeout /t 2 /nobreak >nul
+)
+
 echo === 1/4 Installing PyInstaller ===
 %PY% -m pip install -q pyinstaller
 
@@ -40,6 +48,8 @@ echo === 3/4 Copying config and model ===
 set OUT=dist\Japo
 if exist cloudflare.txt copy /y cloudflare.txt "%OUT%\" >nul
 if exist gemini_key.txt copy /y gemini_key.txt "%OUT%\" >nul
+if exist ai_custom.json copy /y ai_custom.json "%OUT%\" >nul
+if exist translators.json copy /y translators.json "%OUT%\" >nul
 if exist model (
   echo Copying model folder...
   xcopy /e /i /y /q model "%OUT%\model" >nul
