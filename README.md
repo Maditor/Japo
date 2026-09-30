@@ -2,12 +2,13 @@
 
 **Tác giả:** [Maditor](https://github.com/Maditor) · **Repo:** [github.com/Maditor/Japo](https://github.com/Maditor/Japo)
 
-Phụ đề **thời gian thực** cho video tiếng Nhật trên Windows.
-Japo nghe âm thanh đang phát trên máy (YouTube, trình phát phim, trình duyệt…), nhận diện lời thoại bằng **Whisper**, dịch sang **tiếng Việt** và hiện từng câu trong một thanh dọc gọn gàng bên cạnh màn hình.
+Phụ đề **thời gian thực** cho video tiếng **Nhật, Hàn, Trung và Anh** trên Windows.
+Japo nghe âm thanh đang phát trên máy (YouTube, trình phát phim, trình duyệt…), nhận diện lời thoại bằng **Whisper**, dịch sang **tiếng Việt** (hoặc 11 ngôn ngữ khác) và hiện từng câu trong một thanh dọc gọn gàng bên cạnh màn hình.
 
 - Không cần file phụ đề, không cần tải video về
-- Dịch bằng AI (Cloudflare Workers AI / Gemini), có ngữ cảnh nên xưng hô tự nhiên
-- Hiện kèm phiên âm **romaji** và bản **tiếng Anh**
+- Nghe được **tiếng Nhật, Hàn, Trung, Anh**, hoặc để Japo **tự nhận ngôn ngữ**
+- Dịch bằng AI (Cloudflare, Groq, OpenRouter, Gemini…) có ngữ cảnh nên xưng hô tự nhiên. Hết lượt thì **tự chuyển dịch vụ**
+- Hiện kèm **phiên âm** (romaji / pinyin / tiếng Hàn Latin) và bản **tiếng Anh**
 - Đoán **giọng nam/nữ** để xưng hô đúng hơn
 - Giao diện sáng/tối, nền trong suốt, luôn nằm trên cùng, nhớ vị trí cửa sổ
 
@@ -85,16 +86,30 @@ Japo dùng dịch vụ **đầu tiên đang bật và đã cài đủ**. Nếu d
 
 ## 4. Cách dùng
 
-1. Mở Japo (`run.bat`), rồi mở video tiếng Nhật và phát như bình thường.
+1. Mở Japo (`run.bat`), rồi mở video (tiếng Nhật, Hàn, Trung hoặc Anh) và phát như bình thường.
 2. Japo tự nghe âm thanh từ **loa/tai nghe mặc định** của Windows và hiện phụ đề.
-3. Mỗi câu hiện theo thứ tự: **giờ + ♀/♂** → **romaji** → *tiếng Anh* → **tiếng Việt** (chữ đậm).
+3. Mỗi câu hiện theo thứ tự: **giờ + ♀/♂** → **phiên âm** → *tiếng Anh* → **bản dịch** (chữ đậm).
+
+### Chọn ngôn ngữ
+Vào **⚙ Settings**:
+- **Audio language:** ngôn ngữ của video: *Auto detect*, Japanese, Korean, Chinese, English. Biết trước video tiếng gì thì chọn thẳng sẽ chính xác hơn *Auto*.
+- **Translate to:** ngôn ngữ phụ đề: Vietnamese, English, Japanese, Korean, Chinese (giản thể/phồn thể), Thai, Indonesian, French, Spanish, German, Russian.
+
+Lựa chọn được tự lưu. Thanh dưới cùng hiện cặp ngôn ngữ đang dùng, ví dụ `KO→VI`.
+
+| Ngôn ngữ nghe | Phiên âm hiển thị |
+|---|---|
+| Tiếng Nhật | romaji (*arigatou*) |
+| Tiếng Trung | pinyin có dấu thanh (*xiè xiè*) |
+| Tiếng Hàn | chữ Latin (*gomawoyo*) |
+| Tiếng Anh | không cần |
 
 ### Thanh công cụ
 | Nút | Chức năng |
 |---|---|
 | ⏸ / ▶ | Tạm dừng / tiếp tục nghe |
 | 🗑 | Xoá toàn bộ phụ đề đang hiện |
-| **JP** / **EN** | Ẩn/hiện dòng romaji (hoặc chữ Nhật) / dòng tiếng Anh |
+| **JA/KO/ZH/EN** / **EN** | Nút đầu đổi theo ngôn ngữ đang nghe: ẩn/hiện câu gốc (hoặc phiên âm). Nút sau: ẩn/hiện dòng tiếng Anh |
 | ⊖ / ⊕ | Thu nhỏ / phóng to chữ |
 | ☀ / ☾ | Đổi giao diện sáng / tối |
 | ⚙ | Mở menu cài đặt |
@@ -108,14 +123,15 @@ Japo dùng dịch vụ **đầu tiên đang bật và đã cài đủ**. Nếu d
 - **Background opacity:** làm nền trong suốt, chữ vẫn rõ
 - **Always on top:** luôn nằm trên các cửa sổ khác
 - **Uncensored translation:** dịch sát nghĩa, không nói giảm nói tránh
-- **Show romaji:** hiện phiên âm Latin thay cho chữ Nhật
+- **Audio language / Translate to:** chọn ngôn ngữ nghe và ngôn ngữ dịch
+- **Show romanization:** hiện phiên âm Latin thay cho chữ gốc
 - **Detect speaker gender:** đoán giọng nam/nữ
 - **Translation & API keys…:** chọn dịch vụ dịch, thứ tự ưu tiên và nhập key
 - **Save subtitles (.txt):** lưu toàn bộ phụ đề ra file
 - **Open Japo folder:** mở thư mục chứa app
 
 ### Thanh trạng thái (dưới cùng)
-Vạch âm lượng • đèn trạng thái (**Listening / Translating / Paused**) • số câu hoặc số câu đang chờ • GPU/CPU.
+Vạch âm lượng • đèn trạng thái (**Listening / Translating / Paused**) • số câu (`3⏳` nghĩa là còn 3 câu đang chờ) • cặp ngôn ngữ • dịch vụ vừa dịch. Chữ **CPU** chỉ hiện khi Japo không dùng được GPU.
 
 ---
 
@@ -129,9 +145,11 @@ Vạch âm lượng • đèn trạng thái (**Listening / Translating / Paused*
 | Lỗi GPU / cuDNN | Japo tự chuyển sang CPU. Hoặc đặt `DEVICE = "cpu"` |
 | Nhạc nền to, câu dính liền nhau | Tăng `SENSITIVITY` (ví dụ `0.3`) |
 | Bỏ sót câu nói nhỏ | Giảm `SENSITIVITY` (ví dụ `0.15`) |
-| Muốn phụ đề tiếng Anh | Đặt `TARGET_LANG = "en"` |
+| Muốn phụ đề tiếng Anh | ⚙ Settings → **Translate to** → English |
+| Auto detect nhận nhầm ngôn ngữ | Chọn thẳng ngôn ngữ trong **Audio language** |
 | Cloudflare lỗi 401 | Token sai hoặc thiếu quyền **Workers AI**, tạo token mới theo mẫu Workers AI |
-| Không hiện romaji | Chạy lại `setup.bat` (thiếu thư viện `cutlet`) |
+| Không hiện phiên âm | Chạy lại `setup.bat` (thiếu `cutlet`, `pypinyin` hoặc `korean-romanizer`). Bản exe thì build lại sau khi cài |
+| `translation failed – ModuleNotFoundError` | Thiếu thư viện `requests`: chạy lại `setup.bat` |
 | `No module named ...` sau khi chuyển thư mục | Luôn mở bằng `run.bat`. Nếu vẫn lỗi, xoá thư mục `venv` rồi chạy lại `setup.bat` |
 | App bản exe không chạy | Xem file `japo_log.txt` trong thư mục app |
 
@@ -171,6 +189,7 @@ Model không nằm trong bộ cài (quá nặng), app sẽ tự tải ở lần 
 - Phụ đề trễ khoảng 2–5 giây so với lời thoại.
 - Nhận diện kém khi nhiều người nói chồng lên nhau, nhạc nền rất to, hoặc lời bị lẫn với tiếng thở/cảm thán.
 - Đoán giọng nam/nữ dựa trên cao độ giọng, có thể sai với giọng trầm/cao bất thường.
+- Bộ lọc tiếng thở/cảm thán và câu "ảo" (Whisper tự bịa khi im lặng) được tối ưu cho tiếng Nhật; với ngôn ngữ khác thỉnh thoảng có thể lọt câu kiểu *"Thanks for watching"*.
 - Máy dịch miễn phí (Microsoft/Google) có thể thay đổi hoặc giới hạn bất cứ lúc nào.
 
 ---
