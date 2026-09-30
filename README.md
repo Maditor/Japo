@@ -189,7 +189,7 @@ Model không nằm trong bộ cài (quá nặng), app sẽ tự tải ở lần 
 - Phụ đề trễ khoảng 2–5 giây so với lời thoại.
 - Nhận diện kém khi nhiều người nói chồng lên nhau, nhạc nền rất to, hoặc lời bị lẫn với tiếng thở/cảm thán.
 - Đoán giọng nam/nữ dựa trên cao độ giọng, có thể sai với giọng trầm/cao bất thường.
-- Bộ lọc tiếng thở/cảm thán và câu "ảo" (Whisper tự bịa khi im lặng) được tối ưu cho tiếng Nhật; với ngôn ngữ khác thỉnh thoảng có thể lọt câu kiểu *"Thanks for watching"*.
+- Japo có bộ lọc riêng cho từng ngôn ngữ (Nhật, Hàn, Trung, Anh) để bỏ tiếng thở/cảm thán và câu "ảo" Whisper tự bịa khi im lặng (kiểu *"Thanks for watching"*, *"감사합니다"*, *"谢谢观看"*). Bộ lọc chỉ bỏ những câu này khi Whisper không chắc chắn, nên thỉnh thoảng vẫn có thể lọt một câu.
 - Máy dịch miễn phí (Microsoft/Google) có thể thay đổi hoặc giới hạn bất cứ lúc nào.
 
 ---

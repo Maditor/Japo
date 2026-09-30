@@ -31,11 +31,19 @@ SOURCE_LANGS = {"auto": "Auto detect", "ja": "Japanese", "ko": "Korean", "zh": "
 TARGET_LANGS = {"vi": "Vietnamese", "en": "English", "ja": "Japanese", "ko": "Korean",
                 "zh": "Chinese (Simplified)", "zh-TW": "Chinese (Traditional)", "th": "Thai",
                 "id": "Indonesian", "fr": "French", "es": "Spanish", "de": "German", "ru": "Russian"}
+# Names for other languages Whisper may detect in auto mode (used in the AI prompt)
+_LANG_NAMES = {"ru": "Russian", "uk": "Ukrainian", "th": "Thai", "vi": "Vietnamese", "id": "Indonesian",
+               "ms": "Malay", "tl": "Filipino", "fr": "French", "es": "Spanish", "pt": "Portuguese",
+               "de": "German", "it": "Italian", "nl": "Dutch", "pl": "Polish", "cs": "Czech",
+               "tr": "Turkish", "ar": "Arabic", "hi": "Hindi", "sv": "Swedish", "hu": "Hungarian"}
 # Per-service language codes where they differ from the plain ones
 _EDGE_CODE = {"zh": "zh-Hans", "zh-TW": "zh-Hant"}
 _GOOGLE_CODE = {"zh": "zh-CN", "zh-TW": "zh-TW"}
-# Whisper hint per language: primes vocal sounds as interjections (Japanese only)
-_WHISPER_PROMPT = {"ja": "あっ…んっ、イクっ…はぁ…はぁ…。うん。"}
+# Whisper hint per language: primes vocal sounds to be written as short interjections
+_WHISPER_PROMPT = {"ja": "あっ…んっ、イクっ…はぁ…はぁ…。うん。",
+                   "en": "Ah… mm, oh… hah… hah. Yeah.",
+                   "ko": "아… 음, 하아… 하아… 응.",
+                   "zh": "啊…嗯，哈…哈…。嗯。"}
 CLOUDFLARE_MODEL = "@cf/google/gemma-4-26b-a4b-it"  # used when cloudflare.txt exists
 GEMINI_MODEL = "gemini-2.5-flash"                   # used when gemini_key.txt exists
 FILTER_INTERJECTIONS = True    # hide lines that are only short vocal sounds
@@ -70,44 +78,101 @@ if os.path.isfile(os.path.join(APP_DIR, "model", "model.bin")):
 
 import re as _re
 
-# Phrases Whisper tends to hallucinate from non-speech audio
-SUSPICIOUS = {
-    "ありがとうございました", "ありがとうございます", "ありがとう", "ご視聴ありがとうございました",
-    "おやすみなさい", "お疲れ様でした", "お疲れ様です", "ごちそうさまでした",
-    "チャンネル登録お願いします", "チャンネル登録よろしくお願いします", "字幕", "では",
-    "また会いましょう", "またね", "バイバイ", "さようなら",
-}
-_PUNCT = "。、．，.,!！?？…‥・ー〜～ 　「」『』()（）\"'"
-_INTERJECTION_RE = _re.compile(r"^[あぁいぃうぅえぇおぉんンっッはハぁァアイウエオふフひヒ"
-                       r"ー〜～…‥・。、!！?？♡♥\s]+$")
-
-
-# Short words with real meaning (never filtered)
-REAL_SHORT = {"はい", "うん", "ううん", "いい", "いや", "ええ", "おい", "いえ", "あい", "いいえ",
-              "はいはい", "うんうん", "いいい", "ええっ", "えっ", "へえ", "ほう", "おお"}
+# ---------------------------------------------------------------- per-language filters
+# Punctuation/spaces ignored when comparing phrases (text is also lower-cased)
+_PUNCT = set("。、．，.,!！?？…‥・ー〜～ 　「」『』()（）\"'-~:;：；《》“”‘’")
 
 
 def _norm(t):
-    return "".join(c for c in t if c not in _PUNCT)
+    return "".join(c for c in t.lower() if c not in _PUNCT)
 
 
-# Short expressive words that are often repeated on purpose (never drop these for repetition)
-REPEATABLE_WORDS = ["イク", "いく", "イッちゃう", "いっちゃう", "イっちゃう", "イキそう", "いきそう",
+FILTERS = {
+    "ja": dict(
+        # Phrases Whisper tends to hallucinate from non-speech audio (kept only when very confident)
+        suspicious=["ありがとうございました", "ありがとうございます", "ありがとう", "ご視聴ありがとうございました",
+                    "おやすみなさい", "お疲れ様でした", "お疲れ様です", "ごちそうさまでした",
+                    "チャンネル登録お願いします", "チャンネル登録よろしくお願いします", "字幕", "では",
+                    "また会いましょう", "またね", "バイバイ", "さようなら"],
+        # Lines made only of breathing / vocal sounds
+        interjection=r"^[あぁいぃうぅえぇおぉんンっッはハぁァアイウエオふフひヒー〜～…‥・。、!！?？♡♥\s]+$",
+        # Short words with real meaning (never filtered)
+        real_short=["はい", "うん", "ううん", "いい", "いや", "ええ", "おい", "いえ", "あい", "いいえ",
+                    "はいはい", "うんうん", "いいい", "ええっ", "えっ", "へえ", "ほう", "おお"],
+        # Short expressive words often repeated on purpose (never dropped for repetition)
+        repeatable=["イク", "いく", "イッちゃう", "いっちゃう", "イっちゃう", "イキそう", "いきそう",
                     "気持ちいい", "きもちいい", "ダメ", "だめ", "やめて", "もっと", "すごい",
-                    "出る", "出ちゃう", "待って", "やだ", "いや", "好き"]
+                    "出る", "出ちゃう", "待って", "やだ", "いや", "好き"],
+        joiner="、",
+    ),
+    "en": dict(
+        suspicious=["thank you", "thank you.", "thanks", "thanks for watching", "thank you for watching",
+                    "thank you so much for watching", "thank you very much", "please subscribe",
+                    "like and subscribe", "please like and subscribe", "subscribe to my channel",
+                    "don't forget to subscribe", "see you next time", "see you in the next video",
+                    "i'll see you in the next video", "bye", "bye bye", "goodbye", "you", "the end",
+                    "so", "okay", "oh"],
+        interjection=r"^(?:(?:a+h*|o+h*|u+h+|u+m+|h+m+|m+h*|h+a+|a+h+a+|o+o+h*|h+u+h+|e+h+|mm+|nn+)"
+                     r"[\s,.!?…~\-]*)+$",
+        real_short=["huh", "oh no", "ah ha", "aha"],
+        repeatable=["yes", "no", "more", "please", "stop", "wait", "come on", "oh my god", "don't stop",
+                    "right there", "harder", "faster"],
+        joiner=", ",
+    ),
+    "ko": dict(
+        suspicious=["감사합니다", "고맙습니다", "시청해주셔서 감사합니다", "시청해 주셔서 감사합니다",
+                    "구독과 좋아요 부탁드립니다", "구독 부탁드립니다", "좋아요와 구독", "구독", "좋아요",
+                    "다음 영상에서 만나요", "안녕히 계세요", "안녕히 가세요", "자막", "끝", "바이바이"],
+        interjection=r"^[아어오우으음응흐하헉흑앗읏힝앙흥후히ㅎㅋ~…!?.,\s]+$",
+        real_short=["응", "네", "예", "어", "아니", "음 네", "그래"],
+        repeatable=["더", "싫어", "안 돼", "안돼", "잠깐", "좋아", "제발", "아파", "그만", "빨리", "가"],
+        joiner=", ",
+    ),
+    "zh": dict(
+        suspicious=["谢谢观看", "谢谢收看", "感谢观看", "谢谢大家", "谢谢", "谢谢观赏", "请订阅", "订阅",
+                    "点赞", "请点赞订阅", "字幕", "中文字幕", "再见", "拜拜", "下期再见", "我们下期再见"],
+        interjection=r"^[啊嗯哦喔呃唔哈呀嘿哼噢哎诶欸嘤呜~…！？!?。，,\s]+$",
+        real_short=["嗯", "嗯嗯", "哦", "好", "对", "是", "诶"],
+        repeatable=["不要", "快", "快点", "等等", "等一下", "好舒服", "还要", "停", "别停", "好", "再来"],
+        joiner="，",
+    ),
+    "ru": dict(
+        suspicious=["спасибо за просмотр", "спасибо", "продолжение следует", "подписывайтесь на канал",
+                    "ставьте лайки", "до свидания", "пока", "до новых встреч", "всем пока"],
+        interjection=r"^(?:(?:а+х*|о+х*|у+х*|э+|м+|х+а+|а+а+|ох|ах|ух|ммм*|н+)[\s,.!?…~\-]*)+$",
+        real_short=["да", "нет", "ну", "ага", "угу"],
+        repeatable=["да", "нет", "ещё", "еще", "быстрее", "стой", "подожди", "пожалуйста", "не останавливайся"],
+        joiner=", ",
+    ),
+}
+# Credits/ads Whisper copies from its training data: never real dialogue in any language
+ALWAYS_DROP = ["amara.org", "castingwords", "字幕由", "明镜", "点点栏目", "mbc 뉴스", "字幕提供",
+               "字幕製作", "subtitles by", "transcribed by", "translated by",
+               "dimatorzok", "субтитры", "редактор субтитров", "корректор"]
+
+for _f in FILTERS.values():
+    _f["suspicious"] = {_norm(x) for x in _f["suspicious"]}
+    _f["real_short"] = {_norm(x) for x in _f["real_short"]}
+    _f["repeatable"] = sorted(((_norm(x), x) for x in _f["repeatable"]), key=lambda p: -len(p[0]))
+    _f["interjection"] = _re.compile(_f["interjection"], _re.I)
 
 
-def collapse_repeats(text):
+def _filters(lang):
+    return FILTERS.get(lang, FILTERS["en"] if lang not in ("ja", "zh", "ko") else FILTERS["ja"])
+
+
+def collapse_repeats(text, lang="ja"):
     """'イクイクイクイク' -> 'イク、イク、イク…'. Returns None if the text is not such a repeat."""
+    f = _filters(lang)
     n = _norm(text)
-    for w in sorted(REPEATABLE_WORDS, key=len, reverse=True):
-        if len(n) >= 2 * len(w) and n == w * (len(n) // len(w)):
+    for w, shown in f["repeatable"]:
+        if w and len(n) >= 2 * len(w) and n == w * (len(n) // len(w)):
             k = len(n) // len(w)
-            return "、".join([w] * min(k, 3)) + ("…" if k > 3 else "")
+            return f["joiner"].join([shown] * min(k, 3)) + ("…" if k > 3 else "")
     return None
 
 
-def keep_segment(text, avg_logprob, no_speech_prob, compression_ratio):
+def keep_segment(text, avg_logprob, no_speech_prob, compression_ratio, lang="ja"):
     """Decide whether to keep a transcribed segment."""
     t = (text or "").strip()
     if not t:
@@ -115,18 +180,21 @@ def keep_segment(text, avg_logprob, no_speech_prob, compression_ratio):
     n = _norm(t)
     if not n:
         return False
+    f = _filters(lang)
+    low = t.lower()
+    if any(x in low for x in ALWAYS_DROP):
+        return False
     # 1) interjection-only lines
-    if FILTER_INTERJECTIONS and _INTERJECTION_RE.match(t) and len(n) <= 12 and n not in REAL_SHORT:
+    if FILTER_INTERJECTIONS and f["interjection"].match(t) and len(n) <= 12 and n not in f["real_short"]:
         return False
     # 2) common hallucinations: keep only when highly confident
     if STRICT_THANKS:
-        base = n
-        repeated = any(base == p * k for p in SUSPICIOUS for k in (2, 3, 4))
-        if base in SUSPICIOUS or repeated:
+        repeated = any(n == p * k for p in f["suspicious"] for k in (2, 3, 4))
+        if n in f["suspicious"] or repeated:
             if repeated or avg_logprob < -0.3 or no_speech_prob > 0.15:
                 return False
     # 3) repetitive or low-confidence output (expressive repeats are allowed)
-    if compression_ratio > 2.4 and not collapse_repeats(t):
+    if compression_ratio > 2.4 and not collapse_repeats(t, lang):
         return False
     if no_speech_prob > 0.6 and avg_logprob < -0.8:
         return False
@@ -617,8 +685,8 @@ class SubtitleEngine:
         parts = []
         for s in segments:
             t = s.text.strip()
-            if keep_segment(t, s.avg_logprob, s.no_speech_prob, s.compression_ratio):
-                t = collapse_repeats(t) or t
+            if keep_segment(t, s.avg_logprob, s.no_speech_prob, s.compression_ratio, self.cur_src):
+                t = collapse_repeats(t, self.cur_src) or t
                 parts.append(t)
         sep = "" if self.cur_src in ("ja", "zh") else " "
         return sep.join(parts).strip()
@@ -746,7 +814,7 @@ class SubtitleEngine:
 
     def _llm_prompt(self, text, gender=None):
         T = TARGET_LANGS.get(TARGET_LANG, TARGET_LANG)
-        S = SOURCE_LANGS.get(self.src(), "foreign-language")
+        S = SOURCE_LANGS.get(self.src()) or _LANG_NAMES.get(self.src(), "foreign-language")
         who = {"f": "[female voice] ", "m": "[male voice] "}
         prev = "\n".join(f"- {who.get(g, '')}{ja}  =>  {tr}" for ja, tr, g in self._context)
         speaker = {"f": "female", "m": "male"}.get(gender)
