@@ -10,7 +10,7 @@ import os
 import queue
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 
@@ -700,9 +700,10 @@ class SubtitleEngine:
             # Falling behind: transcribe queued segments in one pass
             pieces = [audio]
             total = len(audio) / TARGET_RATE
+            start_ts, end_ts = ts - timedelta(seconds=total), ts     # ts = moment the segment ended
             while total < MERGE_MAX_SEC:
                 try:
-                    _, nxt = self.seg_q.get_nowait()
+                    end_ts, nxt = self.seg_q.get_nowait()
                 except queue.Empty:
                     break
                 pieces.append(np.zeros(int(0.3 * TARGET_RATE), dtype=np.float32))
@@ -735,7 +736,7 @@ class SubtitleEngine:
             if len(short) <= 3 and short == last[0] and time.time() - last[1] < 30:
                 continue
             self._last_short = (short, time.time())
-            self.tr_q.put((ts, text, gender))
+            self.tr_q.put(((start_ts, end_ts), text, gender))
 
     def _translator_loop(self):
         """Translate on a separate thread so transcription never waits."""
@@ -1167,7 +1168,7 @@ def run_ui():
     import json
     import tkinter as tk
     import tkinter.font as tkfont
-    from tkinter import filedialog
+    from tkinter import filedialog, messagebox
 
     # Crisp text on scaled displays
     if os.name == "nt":
@@ -1481,8 +1482,19 @@ def run_ui():
         engine.paused = not engine.paused
         pause_btn.set_icon("play" if engine.paused else "pause")
 
+    timeline = {"t0": None}          # wall-clock start of the first heard line = 00:00
+
+    def elapsed(t):
+        return max(0.0, (t - timeline["t0"]).total_seconds())
+
+    def fmt_elapsed(sec):
+        sec = int(sec)
+        h, m, s_ = sec // 3600, sec // 60 % 60, sec % 60
+        return f"{h}:{m:02d}:{s_:02d}" if h else f"{m:02d}:{s_:02d}"
+
     def clear():
         history.clear()
+        timeline["t0"] = None
         text.config(state="normal")
         text.delete("1.0", "end")
         text.config(state="disabled")
@@ -1632,7 +1644,7 @@ def run_ui():
         text.config(state="normal")
         if last_vi["start"]:
             text.tag_add("vi_old", last_vi["start"], "vi_end")
-        text.insert("end", f"{ts:%H:%M:%S}", "time")
+        text.insert("end", fmt_elapsed(ts[0]), "time")
         if gender in ("f", "m"):
             text.insert("end", "  ♀" if gender == "f" else "  ♂", ("time", "g_" + gender))
         text.insert("end", "\n", "time")
@@ -1746,17 +1758,33 @@ def run_ui():
         raise_pair()
         save_settings()
 
-    def save_txt():
-        path = filedialog.asksaveasfilename(defaultextension=".txt", initialfile="japo_subtitles.txt",
-                                            filetypes=[("Text", "*.txt")])
-        if path:
-            with open(path, "w", encoding="utf-8") as f:
-                if engine.movie_context:
-                    f.write(f"Film context: {engine.movie_context}\n\n")
-                for ts, ja, vi, en, ro, g in history:
-                    tag = {"f": " (F)", "m": " (M)"}.get(g, "")
-                    f.write(f"[{ts:%H:%M:%S}]{tag}\n{ja}\n" + (f"{ro}\n" if ro else "")
-                            + (f"{en}\n" if en else "") + f"{vi}\n\n")
+    def srt_time(sec):
+        ms = int(round(sec * 1000))
+        return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+
+    def save_srt(which):
+        """Write the session as .srt; time 00:00 = first heard line. which: 'original' | 'translation'."""
+        rows = []
+        for (start, end), ja, vi, en, ro, g in history:
+            line = ja if which == "original" else vi
+            if not line or (which == "translation" and line.startswith("(translation")):
+                continue
+            rows.append([start, max(end, start + 1.0), line.strip()])
+        if not rows:
+            messagebox.showinfo("Japo", "No subtitles to save yet.")
+            return
+        for k in range(len(rows) - 1):          # no overlaps: end before the next line starts
+            nxt = rows[k + 1][0]
+            if rows[k][1] > nxt:
+                rows[k][1] = max(rows[k][0] + 0.3, nxt - 0.05)
+        suffix = "original" if which == "original" else TARGET_LANG
+        path = filedialog.asksaveasfilename(defaultextension=".srt", initialfile=f"japo_{suffix}.srt",
+                                            filetypes=[("SubRip subtitles", "*.srt")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8-sig") as f:      # BOM: players detect UTF-8 reliably
+            for n, (start, end, line) in enumerate(rows, 1):
+                f.write(f"{n}\n{srt_time(start)} --> {srt_time(end)}\n{line}\n\n")
 
     alpha_menu = paint(tk.Menu(menu, tearoff=0, bd=0, font=(UI, 9)), **MENU_COLORS)
     for label, val in (("100%", 1.0), ("80%", 0.8), ("60%", 0.6), ("40%", 0.4), ("20%", 0.2)):
@@ -2140,7 +2168,10 @@ def run_ui():
         win.geometry(f"+{max(0, x)}+{max(0, root.winfo_rooty() + px(40))}")
 
     menu.add_command(label="Translation & API keys…", command=open_translation_dialog)
-    menu.add_command(label="Save subtitles (.txt)…", command=save_txt)
+    srt_menu = paint(tk.Menu(menu, tearoff=0, bd=0, font=(UI, 9)), **MENU_COLORS)
+    srt_menu.add_command(label="Original…", command=lambda: save_srt("original"))
+    srt_menu.add_command(label="Translation…", command=lambda: save_srt("translation"))
+    menu.add_cascade(label="Save subtitles (.srt)", menu=srt_menu)
     menu.add_command(label="Open Japo folder", command=lambda: os.startfile(APP_DIR)
                      if os.name == "nt" else None)
 
@@ -2197,7 +2228,10 @@ def run_ui():
                     print("ERROR:", msg[1], flush=True)
                     add_error(msg[1])
                 elif msg[0] == "line":
-                    _, ts, ja, vi, en, ro, g = msg
+                    _, (t_start, t_end), ja, vi, en, ro, g = msg
+                    if timeline["t0"] is None:
+                        timeline["t0"] = t_start
+                    ts = (elapsed(t_start), elapsed(t_end))
                     history.append((ts, ja, vi, en, ro, g))
                     add_line(ts, ja, vi, en, ro, g)
         except queue.Empty:
