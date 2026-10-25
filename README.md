@@ -88,7 +88,7 @@ Japo dùng dịch vụ **đầu tiên đang bật và đã cài đủ**. Nếu d
 
 1. Mở Japo (`run.bat`), rồi mở video (tiếng Nhật, Hàn, Trung hoặc Anh) và phát như bình thường.
 2. Japo tự nghe âm thanh từ **loa/tai nghe mặc định** của Windows và hiện phụ đề.
-3. Mỗi câu hiện theo thứ tự: **giờ + ♀/♂** → **phiên âm** → *tiếng Anh* → **bản dịch** (chữ đậm).
+3. Mỗi câu hiện theo thứ tự: **thời điểm (tính từ câu đầu tiên = 00:00) + ♀/♂** → **phiên âm** → *tiếng Anh* → **bản dịch** (chữ đậm).
 
 ### Chọn ngôn ngữ
 Vào **⚙ Settings**:
@@ -127,7 +127,7 @@ Lựa chọn được tự lưu. Thanh dưới cùng hiện cặp ngôn ngữ đ
 - **Show romanization:** hiện phiên âm Latin thay cho chữ gốc
 - **Detect speaker gender:** đoán giọng nam/nữ
 - **Translation & API keys…:** chọn dịch vụ dịch, thứ tự ưu tiên và nhập key
-- **Save subtitles (.txt):** lưu toàn bộ phụ đề ra file
+- **Save subtitles (.srt):** lưu phụ đề dạng `.srt`, chọn **Original** (câu gốc) hoặc **Translation** (bản dịch). Thời gian tính từ câu đầu tiên Japo nghe được (= 00:00), bấm 🗑 sẽ đếm lại từ đầu. Muốn file khớp với video thì bật Japo trước rồi phát video từ đầu, không tua.
 - **Open Japo folder:** mở thư mục chứa app
 
 ### Thanh trạng thái (dưới cùng)
