@@ -133,6 +133,24 @@ Lựa chọn được tự lưu. Thanh dưới cùng hiện cặp ngôn ngữ đ
 ### Thanh trạng thái (dưới cùng)
 Vạch âm lượng • đèn trạng thái (**Listening / Translating / Paused**) • số câu (`3⏳` nghĩa là còn 3 câu đang chờ) • cặp ngôn ngữ • dịch vụ vừa dịch. Chữ **CPU** chỉ hiện khi Japo không dùng được GPU.
 
+### Chế độ Video (phụ đề khớp lời thoại) – thử nghiệm
+Bấm nút **VIDEO** trên thanh công cụ. Japo phát lại video **trễ 10 giây** ngay trong cửa sổ Japo, kèm phụ đề đã dịch hiện **đúng lúc nhân vật nói**.
+
+1. Lần đầu: chọn app đang phát video (ví dụ `brave.exe`), rồi **kéo khung quanh vùng video** trên màn hình.
+2. Japo chỉ nghe tiếng của app đó và **vặn nó xuống 5%** (tắt chế độ Video hoặc đóng Japo sẽ trả lại như cũ). Tiếng phim sẽ phát ra từ Japo.
+3. Câu nào chưa dịch xong thì video **dừng chờ** (tối đa 5 giây), góc trên hiện *Translating…*.
+4. Rê chuột vào phụ đề để hiện **khung**: kéo bên trong để di chuyển, kéo góc để đổi cỡ (chữ tự vừa khung, nền mờ che sub cứng phía sau). Có đường căn giữa, tự hít vào giữa.
+5. **Thanh thời gian** dưới video: bấm/kéo để tua lại, phím ← → tua 5 giây, bấm **LIVE** để về hiện tại. Japo giữ tối đa 15 phút gần nhất (đổi được 5 / 15 / 30 phút, lưu tạm trên ổ đĩa và tự xoá khi tắt).
+6. **Thanh âm lượng** (0–200%) cạnh nút cỡ chữ. Nút ⏸ tạm dừng phần phát lại (Japo vẫn tiếp tục nghe). Nút **AREA** để chọn lại app và vùng quay.
+
+Trong ⚙ Settings → **Video mode**: chọn độ trễ 10 s – 2 phút và thời gian giữ để tua lại. Thanh dưới cùng hiện độ trễ thực tế, ví dụ `⏱12s`.
+
+Lưu ý:
+- Cần Windows 10 bản 2004 trở lên hoặc Windows 11.
+- Đừng thu nhỏ (minimize) trình duyệt. Nếu Japo che kín trình duyệt mà hình bị đứng, hãy để lộ một phần trình duyệt.
+- Trang có DRM (Netflix, Disney+…) sẽ chỉ quay được màn hình đen.
+- Đừng di chuyển cửa sổ trình duyệt sau khi đã chọn vùng, nếu di chuyển thì chọn lại vùng.
+
 ---
 
 ## 5. Mẹo và xử lý sự cố

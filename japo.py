@@ -497,7 +497,7 @@ class LoopbackCapture:
         raise RuntimeError("No loopback device found for the default speakers.")
 
     def _callback(self, in_data, frame_count, time_info, status):
-        self.out_q.put(in_data)
+        self.out_q.put((in_data, self.rate, self.channels))
         return (None, self.pyaudio.paContinue)
 
     def start(self):
@@ -558,6 +558,12 @@ class SubtitleEngine:
         self.level = 0.0       # current input level (0..1) for the meter
         self.listening = False
         self.busy = False      # transcription in progress
+        # Lines heard but not yet translated: id -> start time (time.time()).
+        # Video mode holds playback before the earliest of them.
+        self.inflight = {}
+        self.open_start = None       # start of the line currently being spoken
+        self._seq = 0
+        self._inflock = threading.Lock()
 
     def status(self, text):
         print(text, flush=True)
@@ -610,12 +616,11 @@ class SubtitleEngine:
         """Split audio into lines at pauses. The silence threshold adapts to the
         playback level, so quiet playback still works."""
         from collections import deque
-        rate, ch = self.capture.rate, self.capture.channels
         buf, speech, silence = [], False, 0.0
         recent = deque(maxlen=150)   # levels of the last ~15 s
         while self.running:
             try:
-                raw = self.audio_q.get(timeout=0.3)
+                raw, rate, ch = self.audio_q.get(timeout=0.3)
                 chunk = to_mono_16k(raw, rate, ch)
                 dur = len(chunk) / TARGET_RATE
             except queue.Empty:
@@ -623,6 +628,7 @@ class SubtitleEngine:
 
             if self.paused:
                 buf, speech, silence = [], False, 0.0
+                self.open_start = None
                 continue
 
             if chunk is None:
@@ -646,6 +652,8 @@ class SubtitleEngine:
                     thr = SILENCE_THRESHOLD
                     self.level = min(1.0, rms / (SILENCE_THRESHOLD * 4))
                 if rms > thr:
+                    if not speech:
+                        self.open_start = time.time() - dur
                     speech, silence = True, 0.0
                 else:
                     silence += dur
@@ -660,8 +668,13 @@ class SubtitleEngine:
                         peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
                         if peak > 1e-5:
                             audio = (audio * min(60.0, 0.9 / peak)).astype(np.float32)
-                    self.seg_q.put((datetime.now(), audio))
+                    with self._inflock:
+                        self._seq += 1
+                        sid = self._seq
+                        self.inflight[sid] = time.time() - total
+                    self.seg_q.put((datetime.now(), audio, sid))
                 buf, speech, silence = [], False, 0.0
+                self.open_start = None
 
     def _transcribe(self, audio):
         segments, info = self.model.transcribe(
@@ -694,16 +707,18 @@ class SubtitleEngine:
     def _transcriber(self):
         while self.running:
             try:
-                ts, audio = self.seg_q.get(timeout=0.5)
+                ts, audio, sid = self.seg_q.get(timeout=0.5)
             except queue.Empty:
                 continue
+            ids = [sid]
             # Falling behind: transcribe queued segments in one pass
             pieces = [audio]
             total = len(audio) / TARGET_RATE
             start_ts, end_ts = ts - timedelta(seconds=total), ts     # ts = moment the segment ended
             while total < MERGE_MAX_SEC:
                 try:
-                    end_ts, nxt = self.seg_q.get_nowait()
+                    end_ts, nxt, nid = self.seg_q.get_nowait()
+                    ids.append(nid)
                 except queue.Empty:
                     break
                 pieces.append(np.zeros(int(0.3 * TARGET_RATE), dtype=np.float32))
@@ -721,28 +736,32 @@ class SubtitleEngine:
                         text = self._transcribe(audio)
                     except Exception as e2:
                         self.ui_q.put(("error", str(e2)))
+                        self._release(ids)
                         continue
                 else:
                     self.ui_q.put(("error", str(e)))
+                    self._release(ids)
                     continue
             finally:
                 self.busy = False
             if not text or all(c in "。、！？…・ 　!?." for c in text):
+                self._release(ids)
                 continue
             gender = classify_voice(audio) if self.detect_gender else None
             # Drop the same very short line repeated within 30 s (e.g. a stream of "うん")
             short = _norm(text)
             last = getattr(self, "_last_short", (None, 0))
             if len(short) <= 3 and short == last[0] and time.time() - last[1] < 30:
+                self._release(ids)
                 continue
             self._last_short = (short, time.time())
-            self.tr_q.put(((start_ts, end_ts), text, gender))
+            self.tr_q.put(((start_ts, end_ts), text, gender, ids))
 
     def _translator_loop(self):
         """Translate on a separate thread so transcription never waits."""
         while self.running:
             try:
-                ts, text, gender = self.tr_q.get(timeout=0.5)
+                ts, text, gender, ids = self.tr_q.get(timeout=0.5)
             except queue.Empty:
                 continue
             try:
@@ -750,6 +769,38 @@ class SubtitleEngine:
             except Exception as e:
                 vi, en = f"(translation error: {e})", None
             self.ui_q.put(("line", ts, text, vi, en, romanize(text, self.src()), gender))
+            self._release(ids)
+
+    def _release(self, ids):
+        with self._inflock:
+            for i in ids:
+                self.inflight.pop(i, None)
+
+    def earliest_pending(self):
+        """Start time of the earliest line still being spoken, transcribed or translated."""
+        if self.paused or not self.listening:
+            return None
+        with self._inflock:
+            vals = list(self.inflight.values())
+        if self.open_start is not None:
+            vals.append(self.open_start)
+        return min(vals) if vals else None
+
+    def set_source(self, src):
+        """Switch the audio source (system loopback <-> one app in video mode)."""
+        old, self.capture = self.capture, src
+        if old is not None and old is not src:
+            old.stop()
+        while True:                                    # drop audio from the old source
+            try:
+                self.audio_q.get_nowait()
+            except queue.Empty:
+                break
+
+    def use_system_audio(self):
+        cap = LoopbackCapture(self.audio_q)
+        cap.start()
+        self.set_source(cap)
 
     # ------------------------------------------------------------ translation
     def src(self):
@@ -1405,6 +1456,10 @@ def run_ui():
             if self.toggle is not None:
                 self.config(fg=C["text"] if self.toggle() else C["faint"])
 
+    # Video-mode state (used by the toolbar; the mode itself is set up further down)
+    video = {"on": False, "player": None, "photo": None, "sub_key": None, "info": None,
+             "size": None, "drag": False}
+
     # ============================================================ TOPBAR
     # Toolbar flush with the top edge
     toolbar = paint(tk.Frame(root), bg="surface")
@@ -1479,6 +1534,11 @@ def run_ui():
         save_settings()
 
     def toggle_pause():
+        if video["on"] and video["player"]:          # video mode: pause the replay, keep listening
+            pl = video["player"]
+            pl.paused = not pl.paused
+            pause_btn.set_icon("play" if pl.paused else "pause")
+            return
         engine.paused = not engine.paused
         pause_btn.set_icon("play" if engine.paused else "pause")
 
@@ -1516,7 +1576,23 @@ def run_ui():
                         tip="Show/hide English", toggle=lambda: state["show_en"])
     ja_btn.pack(side="left", padx=px(2))
     en_btn.pack(side="left", padx=px(2))
+    vid_btn = FlatButton(inner, lambda: toggle_video(), text="VIDEO",
+                         tip=lambda: ("Japo is still starting…" if not engine.listening else
+                                      "Back to the subtitle list" if video["on"] else
+                                      "Video mode: delayed replay with subtitles"))
+    vid_btn.pack(side="left", padx=px(2))
+    area_btn = FlatButton(inner, lambda: redraw_area(), text="AREA",
+                          tip="Choose the app and the video area")     # shown in video mode only
     toggles = [ja_btn, en_btn]
+
+    def vid_color():
+        """VIDEO button: dim while Japo starts, normal when ready, accent while video plays."""
+        if not engine.listening:
+            return C["faint"]
+        if video["on"]:
+            pl = video["player"]
+            return C["accent"] if (pl and pl.ready_to_play()) else C["text"]
+        return C["text"]
 
     # right: text size, theme, settings
     more_btn = FlatButton(inner, lambda: open_menu(), icon="settings", tip="Settings")
@@ -1529,8 +1605,77 @@ def run_ui():
                                                       padx=px(8), pady=px(6))
     FlatButton(inner, lambda: set_font_size(1), icon="font_up", tip="Larger text"
                ).pack(side="right", padx=px(2))
-    FlatButton(inner, lambda: set_font_size(-1), icon="font_dn", tip="Smaller text"
-               ).pack(side="right", padx=px(2))
+    font_dn_btn = FlatButton(inner, lambda: set_font_size(-1), icon="font_dn", tip="Smaller text")
+    font_dn_btn.pack(side="right", padx=px(2))
+
+    # Volume of the video-mode replay (shown in video mode only, left of the text-size buttons)
+    VOL_W, VOL_H = px(96), px(26)
+    vol_cv = paint(tk.Canvas(inner, width=VOL_W, height=VOL_H, highlightthickness=0, cursor="hand2"),
+                   bg="surface")
+    vol_state = {"muted": False}
+
+    def draw_volume():
+        vol_cv.delete("all")
+        v = 0.0 if vol_state["muted"] else float(state.get("video_volume", 1.0)) / 2.0   # 0..200 %
+        col, dim = C["text"], C["faint"]
+        cy = VOL_H / 2
+        # speaker glyph (click to mute)
+        s_ = px(5)
+        vol_cv.create_polygon(px(2), cy - s_ / 2, px(6), cy - s_ / 2, px(11), cy - s_ - px(1),
+                              px(11), cy + s_ + px(1), px(6), cy + s_ / 2, px(2), cy + s_ / 2,
+                              fill=col if v > 0 else dim, outline="")
+        if v > 0:
+            for i, r in enumerate((px(4), px(7))):
+                if v > i * 0.5:
+                    vol_cv.create_arc(px(11) - r, cy - r, px(11) + r, cy + r, start=-45, extent=90,
+                                      style="arc", outline=col, width=max(1, px(1.4)))
+        else:
+            vol_cv.create_line(px(14), cy - px(3), px(19), cy + px(3), fill=dim, width=max(1, px(1.4)))
+            vol_cv.create_line(px(19), cy - px(3), px(14), cy + px(3), fill=dim, width=max(1, px(1.4)))
+        # slider
+        x0, x1 = px(26), VOL_W - px(6)
+        vol_cv.create_line(x0, cy, x1, cy, fill=C["border"], width=px(3), capstyle="round")
+        xm = (x0 + x1) / 2                                # 100 % mark
+        vol_cv.create_line(xm, cy - px(5), xm, cy + px(5), fill=C["faint"], width=1)
+        xv = x0 + (x1 - x0) * v
+        if v > 0:
+            vol_cv.create_line(x0, cy, xv, cy, fill=C["accent"], width=px(3), capstyle="round")
+        r = px(5)
+        vol_cv.create_oval(xv - r, cy - r, xv + r, cy + r, fill=col, outline="")
+
+    def set_volume(v, save=True):
+        v = min(2.0, max(0.0, v))
+        state["video_volume"] = round(v, 3)
+        vol_state["muted"] = v == 0
+        if video["player"]:
+            video["player"].volume = v
+        draw_volume()
+        if save:
+            save_settings()
+
+    def vol_from_x(x):
+        x0, x1 = px(26), VOL_W - px(6)
+        return 2.0 * (x - x0) / max(1, x1 - x0)
+
+    def vol_press(e):
+        if e.x < px(22):                                   # speaker: mute / unmute
+            vol_state["muted"] = not vol_state["muted"]
+            if video["player"]:
+                video["player"].volume = 0.0 if vol_state["muted"] else float(state.get("video_volume", 1.0))
+            if not vol_state["muted"] and state.get("video_volume", 1.0) == 0:
+                set_volume(1.0)
+            draw_volume()
+        else:
+            set_volume(vol_from_x(e.x), save=False)
+
+    vol_cv.bind("<ButtonPress-1>", vol_press)
+    vol_cv.bind("<B1-Motion>", lambda e: e.x >= px(22) and set_volume(vol_from_x(e.x), save=False))
+    vol_cv.bind("<ButtonRelease-1>", lambda e: save_settings())
+    vol_cv.bind("<MouseWheel>", lambda e: set_volume(float(state.get("video_volume", 1.0))
+                                                     + (0.05 if e.delta > 0 else -0.05)))
+    Tip(vol_cv, lambda: f"Video volume {int(round(float(state.get('video_volume', 1.0)) * 100))}%"
+                        + (" (muted)" if vol_state["muted"] else ""))
+    draw_volume()
 
     # Minimum window width = everything on the toolbar fits (plus a small gap in the middle)
     def fit_min_width():
@@ -2175,6 +2320,537 @@ def run_ui():
     menu.add_command(label="Open Japo folder", command=lambda: os.startfile(APP_DIR)
                      if os.name == "nt" else None)
 
+    # ============================================================ VIDEO MODE
+    # The middle area becomes a delayed replay of a screen region with subtitles on top.
+    vcanvas = tk.Canvas(body, bg="#000000", highlightthickness=0, bd=0)
+    v_img = vcanvas.create_image(0, 0, anchor="center")
+    RESTORE_FILE = os.path.join(APP_DIR, "japo_volume_restore.json")
+    DELAYS = (10, 15, 20, 30, 60, 120)
+
+    def exclude_from_capture(on):
+        """Video mode: Japo can sit on top of the browser.
+        1) WDA_EXCLUDEFROMCAPTURE hides Japo's windows from screen capture (Windows 10 2004+).
+        2) A tiny bit of window transparency makes Japo a layered window; Chromium browsers
+           don't count those as covering them, so they keep drawing the video underneath."""
+        if os.name != "nt":
+            return
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        root.update_idletasks()
+        for w in (root, backdrop):
+            try:
+                hwnd = user32.GetParent(w.winfo_id()) or w.winfo_id()
+                if not user32.SetWindowDisplayAffinity(hwnd, 0x11 if on else 0):
+                    print("SetWindowDisplayAffinity failed, error", ctypes.GetLastError(), flush=True)
+            except Exception as e:
+                print("Display affinity:", e, flush=True)
+        try:
+            root.attributes("-alpha", 0.995 if on else 1.0)
+        except tk.TclError:
+            pass
+
+    def run_com(fn):
+        """Run fn(japo_wasapi) on a multithreaded-COM worker thread and return its result."""
+        res = {}
+
+        def work():
+            try:
+                import japo_wasapi as wa
+                wa.com_init()
+                res["v"] = fn(wa)
+            except Exception as e:
+                res["e"] = e
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        t.join(10)
+        if "e" in res:
+            raise res["e"]
+        return res.get("v")
+
+    def pick_app():
+        """Ask which app's audio to use (e.g. brave.exe)."""
+        try:
+            names = run_com(lambda wa: wa.list_audio_apps()) or []
+        except Exception as e:
+            messagebox.showerror("Japo", f"Cannot list apps: {e}")
+            return None
+        names = [n for n in names if n.lower() not in ("japo.exe", "python.exe", "pythonw.exe")]
+        if not names:
+            messagebox.showinfo("Japo", "No app is playing audio.\n"
+                                        "Start the video in your browser first, then try again.")
+            return None
+        win = tk.Toplevel(root)
+        win.title("Video source")
+        win.configure(bg=C["bg"])
+        win.transient(root)
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        pad = px(16)
+        tk.Label(win, text="Which app plays the video?", bg=C["bg"], fg=C["text"],
+                 font=(UI, 11, "bold"), anchor="w").pack(fill="x", padx=pad, pady=(pad, px(2)))
+        tk.Label(win, text="Japo listens to this app only and turns it down to 5 % while video mode "
+                           "is on, then restores it.", bg=C["bg"], fg=C["muted"], font=(UI, 8),
+                 anchor="w", justify="left", wraplength=px(320)).pack(fill="x", padx=pad)
+        lb = tk.Listbox(win, height=min(8, len(names)), font=(UI, 10), bd=0, highlightthickness=1,
+                        bg=C["surface"], fg=C["text"], selectbackground=C["accent"],
+                        selectforeground="#ffffff", highlightbackground=C["border"],
+                        activestyle="none", exportselection=False)
+        for n in names:
+            lb.insert("end", n)
+        cur = (state.get("video_app") or "").lower()
+        idx = next((i for i, n in enumerate(names) if n.lower() == cur),
+                   next((i for i, n in enumerate(names)
+                         if any(b in n.lower() for b in ("brave", "chrome", "msedge", "firefox", "opera"))), 0))
+        lb.selection_set(idx)
+        lb.pack(fill="x", padx=pad, pady=px(10))
+        out = {"v": None}
+
+        def ok(_=None):
+            sel = lb.curselection()
+            out["v"] = names[sel[0]] if sel else None
+            win.destroy()
+        row = tk.Frame(win, bg=C["bg"])
+        row.pack(fill="x", padx=pad, pady=(0, pad))
+        for text_, cmd, primary in (("Next", ok, True), ("Cancel", win.destroy, False)):
+            b = tk.Label(row, text=text_, cursor="hand2", font=(UI, 9, "bold" if primary else "normal"),
+                         bg=C["accent"] if primary else C["surface"],
+                         fg="#ffffff" if primary else C["text"], padx=px(14), pady=px(6))
+            b.bind("<Button-1>", lambda e, c=cmd: c())
+            b.pack(side="right", padx=(px(6), 0))
+        lb.bind("<Double-Button-1>", ok)
+        win.bind("<Return>", ok)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.grab_set()
+        win.focus_force()
+        root.wait_window(win)
+        return out["v"]
+
+    def select_region():
+        """Full-screen overlay: drag a box around the video. Returns (left, top, w, h) or None."""
+        vx, vy, vw, vh = screen_area()
+        root.withdraw()
+        if bd_state["on"]:
+            backdrop.withdraw()
+        sel = tk.Toplevel(root)
+        sel.overrideredirect(True)
+        sel.geometry(f"{vw}x{vh}+{vx}+{vy}")
+        sel.attributes("-alpha", 0.35)
+        sel.attributes("-topmost", True)
+        cv = tk.Canvas(sel, bg="#000000", highlightthickness=0, cursor="crosshair")
+        cv.pack(fill="both", expand=True)
+        cv.create_text(vw // 2, px(70), text="Drag a box around the video   ·   Esc to cancel",
+                       fill="#ffffff", font=(UI, 16, "bold"))
+        r = {"x0": None, "y0": None, "rect": None, "res": None}
+
+        def press(e):
+            r["x0"], r["y0"] = e.x, e.y
+            if r["rect"]:
+                cv.delete(r["rect"])
+            r["rect"] = cv.create_rectangle(e.x, e.y, e.x, e.y, outline="#7cc4b0", width=3)
+
+        def motion(e):
+            if r["rect"]:
+                cv.coords(r["rect"], r["x0"], r["y0"], e.x, e.y)
+
+        def release(e):
+            if r["x0"] is None:
+                return
+            x0, x1 = sorted((r["x0"], e.x))
+            y0, y1 = sorted((r["y0"], e.y))
+            if x1 - x0 >= 80 and y1 - y0 >= 60:
+                r["res"] = (vx + x0, vy + y0, x1 - x0, y1 - y0)
+                sel.destroy()
+        cv.bind("<ButtonPress-1>", press)
+        cv.bind("<B1-Motion>", motion)
+        cv.bind("<ButtonRelease-1>", release)
+        sel.bind("<Escape>", lambda e: sel.destroy())
+        sel.focus_force()
+        sel.grab_set()
+        root.wait_window(sel)
+        root.deiconify()
+        on_map()
+        return r["res"]
+
+    def setup_video_source():
+        app = pick_app()
+        if not app:
+            return False
+        region = select_region()
+        if not region:
+            return False
+        state["video_app"], state["video_region"] = app, list(region)
+        save_settings()
+        return True
+
+    def redraw_area():
+        """AREA button: choose the app and the video area again."""
+        old_app = state.get("video_app")
+        if not setup_video_source():
+            return
+        pl = video["player"]
+        if not pl:
+            return
+        if state["video_app"] == old_app:
+            pl.set_region(tuple(state["video_region"]))     # seamless: keeps playing
+        else:
+            stop_video()                                     # new app: restart capture
+            start_video()
+
+    # ---- Timeline under the video: click/drag to rewind, LIVE jumps back
+    TL_H = px(30)
+    tl_cv = paint(tk.Canvas(body, height=TL_H, highlightthickness=0, cursor="hand2"), bg="surface")
+    tl = {"drag_t": None, "drawn": 0.0}
+
+    def tl_bar():
+        w = max(1, tl_cv.winfo_width())
+        return px(70), w - px(78)
+
+    def draw_timeline(force=False):
+        now = time.time()
+        if not force and tl["drag_t"] is None and now - tl["drawn"] < 0.2:
+            return
+        tl["drawn"] = now
+        tl_cv.delete("all")
+        pl = video["player"]
+        cy = TL_H / 2
+        if not pl or pl.play_t is None:
+            tl_cv.create_text(px(12), cy, text="--:--", anchor="w", fill=C["muted"], font=(UI, 8))
+            return
+        lo, hi = pl.time_range()
+        pos = tl["drag_t"] if tl["drag_t"] is not None else pl.play_t
+        x0, x1 = tl_bar()
+        frac = min(1.0, max(0.0, (pos - lo) / max(1e-3, hi - lo)))
+        xv = x0 + (x1 - x0) * frac
+        tl_cv.create_line(x0, cy, x1, cy, fill=C["border"], width=px(4), capstyle="round")
+        tl_cv.create_line(x0, cy, xv, cy, fill=C["accent"], width=px(4), capstyle="round")
+        r = px(6)
+        tl_cv.create_oval(xv - r, cy - r, xv + r, cy + r, fill=C["text"], outline="")
+        tl_cv.create_text(px(12), cy, text=fmt_elapsed(max(0.0, pos - pl.t_start)), anchor="w",
+                          fill=C["text"], font=(UI, 9, "bold"))
+        live = pl.is_live() and tl["drag_t"] is None
+        tl_cv.create_text(tl_cv.winfo_width() - px(12), cy, anchor="e", tags="live",
+                          text="● LIVE" if live else f"−{fmt_elapsed(hi - pos)}  LIVE",
+                          fill=C["accent"] if live else C["muted"], font=(UI, 8, "bold"))
+
+    def tl_time(x):
+        pl = video["player"]
+        lo, hi = pl.time_range()
+        x0, x1 = tl_bar()
+        return lo + (hi - lo) * min(1.0, max(0.0, (x - x0) / max(1, x1 - x0)))
+
+    def tl_press(e):
+        pl = video["player"]
+        if not pl or pl.play_t is None:
+            return
+        if e.x > tl_bar()[1] + px(8):                      # "LIVE"
+            pl.seek(pl.live_t())
+            draw_timeline(True)
+            return
+        tl["drag_t"] = tl_time(e.x)
+        draw_timeline(True)
+
+    def tl_motion(e):
+        if tl["drag_t"] is not None and video["player"]:
+            tl["drag_t"] = tl_time(e.x)
+            draw_timeline(True)
+
+    def tl_release(e):
+        pl = video["player"]
+        if tl["drag_t"] is not None and pl:
+            pl.seek(tl["drag_t"])
+        tl["drag_t"] = None
+        draw_timeline(True)
+
+    tl_cv.bind("<ButtonPress-1>", tl_press)
+    tl_cv.bind("<B1-Motion>", tl_motion)
+    tl_cv.bind("<ButtonRelease-1>", tl_release)
+
+    def seek_by(sec):
+        pl = video["player"]
+        if not video["on"] or not pl or root.focus_get() is ctx_entry or not pl.can_rewind():
+            return
+        pl.seek(pl.play_t + sec)
+        draw_timeline(True)
+    root.bind("<Left>", lambda e: seek_by(-5), add="+")
+    root.bind("<Right>", lambda e: seek_by(5), add="+")
+
+    def show_video_area(on):
+        if on:
+            text.pack_forget()
+            sb.pack_forget()
+            body.pack_configure(padx=0, pady=0)
+            if int(state.get("video_keep_min", 15)) > 0:
+                tl_cv.pack(side="bottom", fill="x")
+            vcanvas.pack(fill="both", expand=True)
+            area_btn.pack(side="left", padx=px(2), after=vid_btn)
+            vol_cv.pack(side="right", padx=(px(2), px(6)), after=font_dn_btn)
+            draw_volume()
+        else:
+            vcanvas.pack_forget()
+            tl_cv.pack_forget()
+            area_btn.pack_forget()
+            vol_cv.pack_forget()
+            body.pack_configure(padx=(px(12), px(4)), pady=(px(4), 0))
+            sb.pack(side="right", fill="y", padx=(px(4), 0))
+            text.pack(side="left", fill="both", expand=True)
+
+    def video_geometry():
+        g = state.get("geometry_video")
+        if g:
+            return g
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(px(1000), sw - px(80)), min(px(680), sh - px(120))
+        return f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}"
+
+    def start_video():
+        if not engine.listening:
+            messagebox.showinfo("Japo", "Japo is still starting – try again in a moment.")
+            return
+        if not state.get("video_app") or not state.get("video_region"):
+            if not setup_video_source():
+                return
+        try:
+            import japo_video
+            pl = japo_video.VideoPlayer(engine, state["video_app"], tuple(state["video_region"]),
+                                        state.get("video_delay", 10), RESTORE_FILE,
+                                        keep_min=int(state.get("video_keep_min", 15)))
+            pl.start()
+        except Exception as e:
+            messagebox.showerror("Japo", f"Video mode failed: {e}")
+            return
+        pl.volume = float(state.get("video_volume", 1.0))
+        engine.set_source(pl.engine_source())
+        engine.paused = False
+        pause_btn.set_icon("pause")
+        if root.state() == "normal":
+            state["geometry"] = root.geometry()
+        video.update(on=True, player=pl, sub_key=None, info=None, size=None, photo=None)
+        vcanvas.delete("sub", "info")
+        vcanvas.itemconfig(v_img, image="")
+        show_video_area(True)
+        root.geometry(video_geometry())
+        exclude_from_capture(True)
+        save_settings()
+        root.after(30, video_tick)
+
+    def stop_video():
+        pl = video["player"]
+        video.update(on=False, player=None, photo=None)
+        if pl:
+            pl.stop()
+        try:
+            engine.use_system_audio()
+        except Exception as e:
+            add_error(f"Could not return to system audio: {e}")
+        if root.state() == "normal":
+            state["geometry_video"] = root.geometry()
+        show_video_area(False)
+        restore_position()
+        exclude_from_capture(False)
+        pause_btn.set_icon("play" if engine.paused else "pause")
+        save_settings()
+
+    def toggle_video():
+        stop_video() if video["on"] else start_video()
+
+    def draw_overlay(pl, w, h):
+        """Status text (top right). The subtitle itself is drawn into the frame by the player."""
+        if pl.error:
+            info = pl.error
+        elif pl.t_start is None:
+            info = f"Waiting for audio from {pl.app_name}…"
+        elif pl.play_t is None:
+            info = f"Buffering… {pl.buffering_left():.0f}s"
+        elif pl.paused:
+            info = "Paused"
+        elif pl.waiting:
+            info = "Translating…"
+        elif pl.grabber and pl.grabber.error:
+            info = pl.grabber.error
+        else:
+            info = ""
+        if info != video["info"]:
+            video["info"] = info
+            vcanvas.delete("info")
+            if info:
+                vcanvas.create_text(w - px(12), px(10), text=info, anchor="ne", fill="#e9ebf0",
+                                    font=(UI, 9, "bold"), tags="info", width=w - px(24))
+
+    DEFAULT_BOX = (0.12, 0.76, 0.88, 0.96)
+
+    def sub_box_px():
+        w, h = max(1, vcanvas.winfo_width()), max(1, vcanvas.winfo_height())
+        b = state.get("sub_box") or DEFAULT_BOX
+        return w, h, (b[0] * w, b[1] * h, b[2] * w, b[3] * h)
+
+    def push_style(pl):
+        pl.set_style(box=tuple(state.get("sub_box") or DEFAULT_BOX),
+                     max_size=int(px(state["size"]) * 2.4),
+                     show_orig=bool(state["show_ja"]), use_roman=bool(state.get("romaji", True)),
+                     target=TARGET_LANG, source=engine.src())
+
+    def video_tick():
+        pl = video["player"]
+        if not video["on"] or pl is None:
+            return
+        w, h = vcanvas.winfo_width(), vcanvas.winfo_height()
+        if (w, h) != video["size"]:
+            video["size"] = (w, h)
+            pl.set_view_size(w, h)
+            vcanvas.coords(v_img, w // 2, h // 2)
+            video["info"] = None
+            draw_box_ui()
+        push_style(pl)
+        frame = pl.take_image()
+        if frame is not None:
+            from PIL import ImageTk
+            video["photo"] = ImageTk.PhotoImage(frame)
+            vcanvas.itemconfig(v_img, image=video["photo"])
+        draw_overlay(pl, w, h)
+        draw_timeline()
+        root.after(15, video_tick)
+
+    # ---- Subtitle box: hover shows its frame; drag inside to move, drag a corner to resize
+    HANDLE = px(10)
+
+    def draw_box_ui():
+        vcanvas.delete("boxui")
+        if not (video["hover"] or video["drag"]):
+            return
+        w, h, (x0, y0, x1, y1) = sub_box_px()
+        centered = abs((x0 + x1) / 2 - w / 2) < 1.5
+        for ya, yb in ((0, y0 - px(18)), (y1, h)):          # center guide, not over the text
+            if yb > ya:
+                vcanvas.create_line(w / 2, ya, w / 2, yb, fill="#ffd166" if centered else "#7cc4b0",
+                                    width=2 if centered else 1, dash=() if centered else (4, 6),
+                                    tags="boxui")
+        vcanvas.create_rectangle(x0, y0, x1, y1, outline="#7cc4b0", width=2, dash=(6, 4), tags="boxui")
+        for cx, cy in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+            vcanvas.create_rectangle(cx - HANDLE / 2, cy - HANDLE / 2, cx + HANDLE / 2, cy + HANDLE / 2,
+                                     fill="#7cc4b0", outline="", tags="boxui")
+        if not video["drag"]:
+            vcanvas.create_text((x0 + x1) / 2, y0 - px(4), anchor="s", fill="#7cc4b0",
+                                font=(UI, 8, "bold"), tags="boxui",
+                                text="Drag to move · drag a corner to resize")
+
+    def hit_box(x, y):
+        """'move', a corner name ('nw', 'ne', 'sw', 'se') or None."""
+        _, _, (x0, y0, x1, y1) = sub_box_px()
+        for name, (cx, cy) in (("nw", (x0, y0)), ("ne", (x1, y0)), ("sw", (x0, y1)), ("se", (x1, y1))):
+            if abs(x - cx) <= HANDLE and abs(y - cy) <= HANDLE:
+                return name
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return "move"
+        return None
+
+    CURSORS = {"move": "fleur", "nw": "size_nw_se", "se": "size_nw_se",
+               "ne": "size_ne_sw", "sw": "size_ne_sw"}
+
+    def canvas_motion(e):
+        if video["drag"]:
+            return
+        hit = hit_box(e.x, e.y)
+        hover = hit is not None
+        vcanvas.config(cursor=CURSORS.get(hit, ""))
+        if hover != video["hover"]:
+            video["hover"] = hover
+            draw_box_ui()
+
+    def canvas_press(e):
+        hit = hit_box(e.x, e.y)
+        if hit:
+            w, h, _ = sub_box_px()
+            video["drag"] = (hit, e.x / w, e.y / h, tuple(state.get("sub_box") or DEFAULT_BOX))
+
+    def canvas_drag(e):
+        if not video["drag"]:
+            return
+        mode, sx, sy, (b0, b1, b2, b3) = video["drag"]
+        w, h = max(1, vcanvas.winfo_width()), max(1, vcanvas.winfo_height())
+        dx, dy = e.x / w - sx, e.y / h - sy
+        min_w, min_h = 0.15, 0.08
+        if mode == "move":
+            bw, bh = b2 - b0, b3 - b1
+            nx0 = min(max(0.0, b0 + dx), 1.0 - bw)
+            ny0 = min(max(0.0, b1 + dy), 1.0 - bh)
+            box = (nx0, ny0, nx0 + bw, ny0 + bh)
+        else:
+            x0, y0, x1, y1 = b0, b1, b2, b3
+            if "w" in mode:
+                x0 = min(max(0.0, b0 + dx), x1 - min_w)
+            if "e" in mode:
+                x1 = max(min(1.0, b2 + dx), x0 + min_w)
+            if "n" in mode:
+                y0 = min(max(0.0, b1 + dy), y1 - min_h)
+            if "s" in mode:
+                y1 = max(min(1.0, b3 + dy), y0 + min_h)
+            box = (x0, y0, x1, y1)
+        # Snap to the vertical center line when close to it
+        cx = (box[0] + box[2]) / 2
+        if abs(cx - 0.5) * w < px(12):
+            if mode == "move":
+                box = (box[0] + 0.5 - cx, box[1], box[2] + 0.5 - cx, box[3])
+            elif mode in ("ne", "se", "nw", "sw"):          # resize symmetrically around the center
+                half = max(abs(box[0] - 0.5), abs(box[2] - 0.5))
+                box = (0.5 - half, box[1], 0.5 + half, box[3])
+        state["sub_box"] = tuple(round(v, 4) for v in box)
+        draw_box_ui()
+
+    def canvas_release(e):
+        if video["drag"]:
+            video["drag"] = False
+            save_settings()
+            canvas_motion(e)
+
+    def canvas_leave(e):
+        if not video["drag"] and video["hover"]:
+            video["hover"] = False
+            vcanvas.config(cursor="")
+            draw_box_ui()
+
+    video["hover"] = False
+    vcanvas.bind("<Motion>", canvas_motion)
+    vcanvas.bind("<ButtonPress-1>", canvas_press)
+    vcanvas.bind("<B1-Motion>", canvas_drag)
+    vcanvas.bind("<ButtonRelease-1>", canvas_release)
+    vcanvas.bind("<Leave>", canvas_leave)
+
+    video_menu = paint(tk.Menu(menu, tearoff=0, bd=0, font=(UI, 9)), **MENU_COLORS)
+    delay_var = tk.IntVar(value=int(state.get("video_delay", 10)))
+
+    def set_delay():
+        state["video_delay"] = delay_var.get()
+        if video["player"]:
+            video["player"].delay = float(delay_var.get())
+        save_settings()
+
+    for d in DELAYS:
+        video_menu.add_radiobutton(label=f"Delay {d} s", value=d, variable=delay_var, command=set_delay)
+    video_menu.add_separator()
+    keep_var = tk.IntVar(value=int(state.get("video_keep_min", 15)))
+
+    def set_keep():
+        old = int(state.get("video_keep_min", 15))
+        state["video_keep_min"] = keep_var.get()
+        save_settings()
+        pl = video["player"]
+        if not pl:
+            return
+        if (old == 0) != (keep_var.get() == 0):          # switching rewind on/off: restart
+            stop_video()
+            start_video()
+        elif pl.store:
+            pl.store.keep_sec = keep_var.get() * 60
+
+    video_menu.add_radiobutton(label="Rewind off (always live, no temp files)", value=0,
+                               variable=keep_var, command=set_keep)
+    for m, note_ in ((5, "≈0.5 GB"), (15, "≈1.5 GB"), (30, "≈3 GB")):
+        video_menu.add_radiobutton(label=f"Rewind up to {m} min ({note_} temp disk)", value=m,
+                                   variable=keep_var, command=set_keep)
+    menu.insert_cascade(0, label="Video mode", menu=video_menu)
+    menu.insert_separator(1)
+
     def toggle_theme():
         state["theme"] = "light" if state["theme"] == "dark" else "dark"
         light_var.set(state["theme"] == "light")
@@ -2234,6 +2910,9 @@ def run_ui():
                     ts = (elapsed(t_start), elapsed(t_end))
                     history.append((ts, ja, vi, en, ro, g))
                     add_line(ts, ja, vi, en, ro, g)
+                    if video["player"]:
+                        shown = ja if vi.startswith("(translation") else vi
+                        video["player"].add_line(t_start.timestamp(), t_end.timestamp(), shown, ja, ro)
         except queue.Empty:
             pass
 
@@ -2256,7 +2935,16 @@ def run_ui():
             count = f"{wait}⏳" if wait else str(n)
             pair = f"{engine.src().upper()}→{TARGET_LANG.split('-')[0].upper()}"
             cpu = "  ·  CPU" if engine.device != "cuda" else ""       # only flag the slow case
-            foot_right.config(text=f"{count}  ·  {pair}  ·  {svc}{cpu}")
+            lag = ""
+            if video["player"] and video["player"].current_delay() is not None:
+                lag = f"  ·  ⏱{video['player'].current_delay():.0f}s"
+            foot_right.config(text=f"{count}  ·  {pair}  ·  {svc}{cpu}{lag}")
+        if video["on"] and vol_state.get("theme") != state["theme"]:
+            vol_state["theme"] = state["theme"]
+            draw_volume()
+        want = vid_color()
+        if vid_btn.cget("fg") != want:
+            vid_btn.config(fg=want)
         src_label = engine.src().upper()
         if ja_btn.cget("text") != src_label:
             ja_btn.config(text=src_label)
@@ -2274,7 +2962,51 @@ def run_ui():
         update_meter()
         root.after(100, poll)
 
+    def confirm_quit():
+        """Small themed 'Quit Japo?' dialog. Returns True to quit."""
+        win = tk.Toplevel(root)
+        win.title("Japo")
+        win.configure(bg=C["bg"])
+        win.transient(root)
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        pad = px(18)
+        tk.Label(win, text="Quit Japo?", bg=C["bg"], fg=C["text"], font=(UI, 11, "bold"),
+                 anchor="w").pack(fill="x", padx=pad, pady=(pad, px(2)))
+        msg = "Subtitles will stop."
+        if video["on"]:
+            msg += " Video mode will end and the browser volume is restored."
+        tk.Label(win, text=msg, bg=C["bg"], fg=C["muted"], font=(UI, 9), anchor="w", justify="left",
+                 wraplength=px(300)).pack(fill="x", padx=pad)
+        out = {"v": False}
+        row = tk.Frame(win, bg=C["bg"])
+        row.pack(fill="x", padx=pad, pady=(px(14), pad))
+
+        def done(v):
+            out["v"] = v
+            win.destroy()
+        for text_, v, primary in (("Quit", True, True), ("Cancel", False, False)):
+            b = tk.Label(row, text=text_, cursor="hand2", font=(UI, 9, "bold" if primary else "normal"),
+                         bg=C["err"] if primary else C["surface"],
+                         fg="#ffffff" if primary else C["text"], padx=px(16), pady=px(6))
+            b.bind("<Button-1>", lambda e, v=v: done(v))
+            b.pack(side="right", padx=(px(6), 0))
+        win.bind("<Return>", lambda e: done(True))
+        win.bind("<Escape>", lambda e: done(False))
+        win.update_idletasks()
+        x = root.winfo_rootx() + (root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = root.winfo_rooty() + (root.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.grab_set()
+        win.focus_force()
+        root.wait_window(win)
+        return out["v"]
+
     def on_close():
+        if not confirm_quit():
+            return
+        if video["on"]:
+            stop_video()                 # restores the browser volume
         save_settings()
         engine.stop()
         root.destroy()

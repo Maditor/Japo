@@ -10,3 +10,8 @@ unidic-lite
 pypinyin
 korean-romanizer
 requests
+mss
+pillow
+pycaw
+comtypes
+psutil

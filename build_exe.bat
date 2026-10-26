@@ -32,6 +32,10 @@ echo === 2/4 Building (this takes a few minutes) ===
   --collect-binaries pyaudiowpatch ^
   --collect-all cutlet ^
   --collect-all pypinyin ^
+  --collect-all pycaw ^
+  --collect-submodules comtypes ^
+  --hidden-import japo_video ^
+  --hidden-import japo_wasapi ^
   --collect-all korean_romanizer ^
   --collect-all fugashi ^
   --collect-all unidic_lite ^
