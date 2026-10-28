@@ -124,6 +124,7 @@ Lựa chọn được tự lưu. Thanh dưới cùng hiện cặp ngôn ngữ đ
 - **Always on top:** luôn nằm trên các cửa sổ khác
 - **Uncensored translation:** dịch sát nghĩa, không nói giảm nói tránh
 - **Audio language / Translate to:** chọn ngôn ngữ nghe và ngôn ngữ dịch
+- **Recognition quality:** độ kỹ khi nghe. **Fast** nhẹ nhất · **Balanced** (mặc định) nghe tốt hơn khi nói nhanh, hét to, có nhạc nền · **Accurate** dùng model `large-v3` đầy đủ (tải thêm ~3 GB, chậm hơn) cho phim khó
 - **Show romanization:** hiện phiên âm Latin thay cho chữ gốc
 - **Detect speaker gender:** đoán giọng nam/nữ
 - **Translation & API keys…:** chọn dịch vụ dịch, thứ tự ưu tiên và nhập key
@@ -134,14 +135,14 @@ Lựa chọn được tự lưu. Thanh dưới cùng hiện cặp ngôn ngữ đ
 Vạch âm lượng • đèn trạng thái (**Listening / Translating / Paused**) • số câu (`3⏳` nghĩa là còn 3 câu đang chờ) • cặp ngôn ngữ • dịch vụ vừa dịch. Chữ **CPU** chỉ hiện khi Japo không dùng được GPU.
 
 ### Chế độ Video (phụ đề khớp lời thoại) – thử nghiệm
-Bấm nút **VIDEO** trên thanh công cụ. Japo phát lại video **trễ 10 giây** ngay trong cửa sổ Japo, kèm phụ đề đã dịch hiện **đúng lúc nhân vật nói**.
+Bấm nút **Video** (hình màn hình có nút ▶) trên thanh công cụ. Nút mờ khi Japo đang khởi động, sáng màu hồng khi video đang phát. Japo phát lại video **trễ 10 giây** ngay trong cửa sổ Japo, kèm phụ đề đã dịch hiện **đúng lúc nhân vật nói**.
 
 1. Lần đầu: chọn app đang phát video (ví dụ `brave.exe`), rồi **kéo khung quanh vùng video** trên màn hình.
 2. Japo chỉ nghe tiếng của app đó và **vặn nó xuống 5%** (tắt chế độ Video hoặc đóng Japo sẽ trả lại như cũ). Tiếng phim sẽ phát ra từ Japo.
 3. Câu nào chưa dịch xong thì video **dừng chờ** (tối đa 5 giây), góc trên hiện *Translating…*.
 4. Rê chuột vào phụ đề để hiện **khung**: kéo bên trong để di chuyển, kéo góc để đổi cỡ (chữ tự vừa khung, nền mờ che sub cứng phía sau). Có đường căn giữa, tự hít vào giữa.
 5. **Thanh thời gian** dưới video: bấm/kéo để tua lại, phím ← → tua 5 giây, bấm **LIVE** để về hiện tại. Japo giữ tối đa 15 phút gần nhất (đổi được 5 / 15 / 30 phút, lưu tạm trên ổ đĩa và tự xoá khi tắt).
-6. **Thanh âm lượng** (0–200%) cạnh nút cỡ chữ. Nút ⏸ tạm dừng phần phát lại (Japo vẫn tiếp tục nghe). Nút **AREA** để chọn lại app và vùng quay.
+6. **Thanh âm lượng** (0–200%) cạnh nút cỡ chữ. Nút ⏸ tạm dừng phần phát lại (Japo vẫn tiếp tục nghe). Nút **Area** (khung có 4 góc) để chọn lại app và vùng quay. Nút **New** (mũi tên vòng) khi chuyển sang video khác: xoá phần đã nghe/đã lưu và chờ lại từ đầu theo độ trễ đã đặt.
 
 Trong ⚙ Settings → **Video mode**: chọn độ trễ 10 s – 2 phút và thời gian giữ để tua lại. Thanh dưới cùng hiện độ trễ thực tế, ví dụ `⏱12s`.
 
@@ -159,7 +160,8 @@ Lưu ý:
 |---|---|
 | Đeo tai nghe nhưng không nghe được | Để âm lượng **trong trình phát** 50–100%, giảm âm lượng **Windows** cho vừa tai. Japo có tự khuếch đại |
 | Không hiện phụ đề | Kiểm tra vạch âm lượng có nhảy không. Nếu vừa đổi loa/tai nghe thì tắt Japo mở lại |
-| Chậm, nhiều câu "queued" | Mở `japo.py`, đổi `MODEL_SIZE = "small"` |
+| Chậm, nhiều câu "queued" | ⚙ → **Recognition quality → Fast**. Vẫn chậm thì mở `japo.py`, đổi `MODEL_SIZE = "small"` |
+| Bỏ sót câu nói nhanh, hét to, phim nhiều nhạc nền | ⚙ → **Recognition quality → Balanced** hoặc **Accurate** |
 | Lỗi GPU / cuDNN | Japo tự chuyển sang CPU. Hoặc đặt `DEVICE = "cpu"` |
 | Nhạc nền to, câu dính liền nhau | Tăng `SENSITIVITY` (ví dụ `0.3`) |
 | Bỏ sót câu nói nhỏ | Giảm `SENSITIVITY` (ví dụ `0.15`) |

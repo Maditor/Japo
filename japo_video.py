@@ -542,6 +542,31 @@ class VideoPlayer:
         # Feed the subtitle engine (same format its loopback capture produces)
         self.engine.audio_q.put((pcm16.tobytes(), RATE, CHANNELS))
 
+    def reset(self):
+        """New video: forget everything recorded and buffer `delay` seconds again.
+        Capture keeps running, so nothing has to be re-initialised."""
+        old = self.store
+        if self.keep_min > 0:
+            self.store = MediaStore(keep_sec=self.keep_min * 60)
+        else:
+            self.store = MemoryStore(keep_sec=self.delay + 60)
+        if self.grabber:
+            self.grabber.store = self.store
+        self.t_start = None
+        self.play_t = None
+        self.waiting = False
+        self._wait_since = None
+        self._skip_upto = time.time()          # don't wait for lines from the previous video
+        with self.subs_lock:
+            self.subs.clear()
+        self._patch_cache.clear()
+        try:
+            self._img_q.get_nowait()
+        except queue.Empty:
+            pass
+        if old:
+            threading.Timer(0.6, old.close).start()
+
     def engine_source(self):
         return _EngineSource(self.app_name, self)
 

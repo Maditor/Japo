@@ -40,7 +40,7 @@ _LANG_NAMES = {"ru": "Russian", "uk": "Ukrainian", "th": "Thai", "vi": "Vietname
 _EDGE_CODE = {"zh": "zh-Hans", "zh-TW": "zh-Hant"}
 _GOOGLE_CODE = {"zh": "zh-CN", "zh-TW": "zh-TW"}
 # Whisper hint per language: primes vocal sounds to be written as short interjections
-_WHISPER_PROMPT = {"ja": "あっ…んっ、イクっ…はぁ…はぁ…。うん。",
+_WHISPER_PROMPT = {"ja": "えっ、何？ちょっと待って！…あっ、んっ…はぁ…はぁ…。うん、わかった。",
                    "en": "Ah… mm, oh… hah… hah. Yeah.",
                    "ko": "아… 음, 하아… 하아… 응.",
                    "zh": "啊…嗯，哈…哈…。嗯。"}
@@ -48,7 +48,14 @@ CLOUDFLARE_MODEL = "@cf/google/gemma-4-26b-a4b-it"  # used when cloudflare.txt e
 GEMINI_MODEL = "gemini-2.5-flash"                   # used when gemini_key.txt exists
 FILTER_INTERJECTIONS = True    # hide lines that are only short vocal sounds
 STRICT_THANKS = True           # drop low-confidence "arigatou..." hallucinations
-BEAM_SIZE = 1                  # 1 = fastest, 3-5 = slightly more accurate
+QUALITY = "balanced"           # recognition preset, see QUALITY_PRESETS (changeable in Settings)
+# fast: lightest.  balanced: beam search + retries on unclear audio (fast speech, shouting, music).
+# accurate: the full large-v3 model (~3 GB download, slower) for difficult films.
+QUALITY_PRESETS = {
+    "fast":     dict(model=None, beam=1, temps=(0.0,), vad=0.5, min_logprob=-1.2),
+    "balanced": dict(model=None, beam=3, temps=(0.0, 0.2, 0.4), vad=0.4, min_logprob=-1.4),
+    "accurate": dict(model="large-v3", beam=5, temps=(0.0, 0.2, 0.4, 0.6), vad=0.35, min_logprob=-1.5),
+}
 MERGE_MAX_SEC = 15.0           # merge queued segments when falling behind
 CONTEXT_LINES = 6              # previous lines sent to the LLM as context
 CONTEXT_RESET_SEC = 20         # forget context after a gap this long (seeking / pausing)
@@ -172,7 +179,7 @@ def collapse_repeats(text, lang="ja"):
     return None
 
 
-def keep_segment(text, avg_logprob, no_speech_prob, compression_ratio, lang="ja"):
+def keep_segment(text, avg_logprob, no_speech_prob, compression_ratio, lang="ja", min_logprob=-1.2):
     """Decide whether to keep a transcribed segment."""
     t = (text or "").strip()
     if not t:
@@ -198,7 +205,7 @@ def keep_segment(text, avg_logprob, no_speech_prob, compression_ratio, lang="ja"
         return False
     if no_speech_prob > 0.6 and avg_logprob < -0.8:
         return False
-    if avg_logprob < -1.2:
+    if avg_logprob < min_logprob:
         return False
     return True
 
@@ -564,6 +571,8 @@ class SubtitleEngine:
         self.open_start = None       # start of the line currently being spoken
         self._seq = 0
         self._inflock = threading.Lock()
+        self._model_lock = threading.Lock()   # held while the model is (re)loading
+        self.quality = QUALITY
 
     def status(self, text):
         print(text, flush=True)
@@ -576,13 +585,38 @@ class SubtitleEngine:
             try:
                 add_cuda_dll_paths()
                 self.status("Loading model on GPU… (first run downloads it)")
-                self.model = WhisperModel(MODEL_SIZE, device="cuda", compute_type=COMPUTE_TYPE)
+                self.model = WhisperModel(self.model_name(), device="cuda", compute_type=COMPUTE_TYPE)
                 return
             except Exception as e:
                 self.ui_q.put(("error", f"GPU unavailable ({e}). Using CPU."))
                 self.device = "cpu"
         self.status("Loading model on CPU…")
         self.model = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=6)
+
+    def preset(self):
+        return QUALITY_PRESETS.get(getattr(self, "quality", QUALITY), QUALITY_PRESETS["balanced"])
+
+    def model_name(self):
+        return self.preset()["model"] or MODEL_SIZE
+
+    def set_quality(self, q):
+        """Switch the recognition preset; reloads the model only when it changes."""
+        old = self.model_name()
+        self.quality = q
+        if self.model is None or self.model_name() == old or self.device != "cuda":
+            return
+        def reload():
+            self._model_lock.acquire()
+            try:
+                self.status(f"Loading {self.model_name()} model… (first time downloads it)")
+                self.model = None
+                self.load_model()
+                self.status(f"Model ready: {self.model_name()}")
+            except Exception as e:
+                self.ui_q.put(("error", f"Could not load {self.model_name()}: {e}"))
+            finally:
+                self._model_lock.release()
+        threading.Thread(target=reload, daemon=True).start()
 
     def fallback_to_cpu(self, err):
         self.ui_q.put(("error", f"GPU error: {err}. Switched to CPU."))
@@ -616,12 +650,36 @@ class SubtitleEngine:
         """Split audio into lines at pauses. The silence threshold adapts to the
         playback level, so quiet playback still works."""
         from collections import deque
+        BLOCK = int(TARGET_RATE * 0.1)   # analyse in 100 ms blocks whatever the capture packet size
         buf, speech, silence = [], False, 0.0
-        recent = deque(maxlen=150)   # levels of the last ~15 s
+        recent = deque(maxlen=150)       # levels of the last ~15 s
+        pending, pending_n = [], 0
+
+        def emit(blocks):
+            total = sum(len(b) for b in blocks) / TARGET_RATE
+            if total < MIN_SEGMENT_SEC:
+                return
+            audio = np.concatenate(blocks)
+            if AUTO_GAIN:                     # normalize level before transcription
+                peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+                if peak > 1e-5:
+                    audio = (audio * min(60.0, 0.9 / peak)).astype(np.float32)
+            end = time.time() - sum(len(b) for b in buf[len(blocks):]) / TARGET_RATE
+            with self._inflock:
+                self._seq += 1
+                sid = self._seq
+                self.inflight[sid] = end - total
+            self.seg_q.put((datetime.fromtimestamp(end), audio, sid))
+
         while self.running:
             try:
                 raw, rate, ch = self.audio_q.get(timeout=0.3)
-                chunk = to_mono_16k(raw, rate, ch)
+                pending.append(to_mono_16k(raw, rate, ch))
+                pending_n += len(pending[-1])
+                if pending_n < BLOCK:
+                    continue
+                chunk = np.concatenate(pending)
+                pending, pending_n = [], 0
                 dur = len(chunk) / TARGET_RATE
             except queue.Empty:
                 chunk, dur = None, 0.3  # no audio (playback paused)
@@ -642,9 +700,11 @@ class SubtitleEngine:
                         recent.append(rms)
                     if len(recent) >= 10:
                         arr = np.array(recent)
-                        loud = float(np.percentile(arr, 90))
+                        loud = float(np.percentile(arr, 75))
                         noise = float(np.percentile(arr, 15))
-                        thr = max(0.0003, noise * 2.0, loud * SENSITIVITY)
+                        # A shout must not raise the bar so high that normal speech after it
+                        # counts as silence: stay within a few times the background level.
+                        thr = max(0.0003, noise * 1.8, min(loud * SENSITIVITY, noise * 6.0))
                     else:
                         loud, thr = 0.02, 0.001
                     self.level = min(1.0, rms / max(loud, 1e-6))
@@ -660,45 +720,51 @@ class SubtitleEngine:
                 if speech:
                     buf.append(chunk)
 
+            if not speech:
+                continue
             total = sum(len(b) for b in buf) / TARGET_RATE
-            if speech and (silence >= SILENCE_SEC or total >= MAX_SEGMENT_SEC):
-                if total >= MIN_SEGMENT_SEC:
-                    audio = np.concatenate(buf)
-                    if AUTO_GAIN:                     # normalize level before transcription
-                        peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
-                        if peak > 1e-5:
-                            audio = (audio * min(60.0, 0.9 / peak)).astype(np.float32)
-                    with self._inflock:
-                        self._seq += 1
-                        sid = self._seq
-                        self.inflight[sid] = time.time() - total
-                    self.seg_q.put((datetime.now(), audio, sid))
+            if silence >= SILENCE_SEC:
+                emit(buf)
                 buf, speech, silence = [], False, 0.0
                 self.open_start = None
+            elif total >= MAX_SEGMENT_SEC and len(buf) > 12:
+                # Long stretch without a pause (fast talk, music): cut at the quietest
+                # moment of the last 2 s instead of in the middle of a word
+                tail = range(max(1, len(buf) - 20), len(buf) - 2)
+                cut = min(tail, key=lambda k: float(np.mean(buf[k] ** 2)))
+                head, rest = buf[:cut + 1], buf[cut + 1:]
+                emit(head)
+                buf = rest
+                self.open_start = time.time() - sum(len(b) for b in buf) / TARGET_RATE
 
     def _transcribe(self, audio):
-        segments, info = self.model.transcribe(
+        p = self.preset()
+        with self._model_lock:                  # wait while the model is being switched
+            model = self.model
+        segments, info = model.transcribe(
             audio,
             language=None if SOURCE_LANG == "auto" else SOURCE_LANG,
-            beam_size=BEAM_SIZE,
-            best_of=1,
-            temperature=0.0,
+            beam_size=p["beam"],
+            best_of=max(1, p["beam"]),
+            # Retry unclear audio (fast speech, shouting, music) with a little randomness
+            temperature=list(p["temps"]) if len(p["temps"]) > 1 else p["temps"][0],
             vad_filter=True,
-            vad_parameters=dict(threshold=0.55, min_speech_duration_ms=300,
-                                min_silence_duration_ms=400, speech_pad_ms=200),
+            vad_parameters=dict(threshold=p["vad"], min_speech_duration_ms=200,
+                                min_silence_duration_ms=400, speech_pad_ms=300),
             condition_on_previous_text=False,
             without_timestamps=True,
             # Prime Whisper to write vocal sounds as interjections instead of inventing sentences
             initial_prompt=_WHISPER_PROMPT.get(SOURCE_LANG),
             compression_ratio_threshold=2.2,
             log_prob_threshold=-1.0,
-            no_speech_threshold=0.5,
+            no_speech_threshold=0.6,
         )
         self.cur_src = (info.language if SOURCE_LANG == "auto" else SOURCE_LANG) or "ja"
         parts = []
         for s in segments:
             t = s.text.strip()
-            if keep_segment(t, s.avg_logprob, s.no_speech_prob, s.compression_ratio, self.cur_src):
+            if keep_segment(t, s.avg_logprob, s.no_speech_prob, s.compression_ratio, self.cur_src,
+                            p["min_logprob"]):
                 t = collapse_repeats(t, self.cur_src) or t
                 parts.append(t)
         sep = "" if self.cur_src in ("ja", "zh") else " "
@@ -1266,11 +1332,20 @@ def run_ui():
         pass
     C.update(THEMES.get(state.get("theme"), THEMES["dark"]))
 
+    # Video-mode state (used by the toolbar and save_settings; the mode itself is set up further down)
+    video = {"on": False, "player": None, "photo": None, "sub_key": None, "info": None,
+             "size": None, "drag": False}
+    video["switching"] = False       # True while the window changes between the two layouts
+
     def save_settings():
         try:
-            state["width"] = int(root.winfo_width() / scale)
-            if root.state() == "normal":          # skip when minimized/maximized
-                state["geometry"] = root.geometry()   # "WxH+X+Y"
+            # Each layout remembers its own size/position: normal list vs. video mode
+            if root.state() == "normal" and not video["switching"] and not video.get("fullscreen"):
+                if video["on"]:
+                    state["geometry_video"] = root.geometry()
+                else:
+                    state["width"] = int(root.winfo_width() / scale)
+                    state["geometry"] = root.geometry()   # "WxH+X+Y"
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=1)
         except Exception:
@@ -1282,6 +1357,8 @@ def run_ui():
         state["uncensored"] = bool(state.pop("adult"))
     engine.uncensored = bool(state.get("uncensored"))
     engine.detect_gender = bool(state.get("gender", True))
+    if state.get("quality") in QUALITY_PRESETS:
+        engine.quality = state["quality"]
     engine.movie_context = str(state.get("context", ""))
     global SOURCE_LANG, TARGET_LANG
     if state.get("source_lang") in SOURCE_LANGS:
@@ -1456,9 +1533,6 @@ def run_ui():
             if self.toggle is not None:
                 self.config(fg=C["text"] if self.toggle() else C["faint"])
 
-    # Video-mode state (used by the toolbar; the mode itself is set up further down)
-    video = {"on": False, "player": None, "photo": None, "sub_key": None, "info": None,
-             "size": None, "drag": False}
 
     # ============================================================ TOPBAR
     # Toolbar flush with the top edge
@@ -1576,23 +1650,26 @@ def run_ui():
                         tip="Show/hide English", toggle=lambda: state["show_en"])
     ja_btn.pack(side="left", padx=px(2))
     en_btn.pack(side="left", padx=px(2))
-    vid_btn = FlatButton(inner, lambda: toggle_video(), text="VIDEO",
+    vid_btn = FlatButton(inner, lambda: toggle_video(), icon="video_dim",
                          tip=lambda: ("Japo is still starting…" if not engine.listening else
                                       "Back to the subtitle list" if video["on"] else
                                       "Video mode: delayed replay with subtitles"))
+    vsep()                                   # video tools get their own group
     vid_btn.pack(side="left", padx=px(2))
-    area_btn = FlatButton(inner, lambda: redraw_area(), text="AREA",
+    new_btn = FlatButton(inner, lambda: new_video(), icon="new",
+                         tip="New video: clear what was heard and buffer again")   # video mode only
+    area_btn = FlatButton(inner, lambda: redraw_area(), icon="area",
                           tip="Choose the app and the video area")     # shown in video mode only
     toggles = [ja_btn, en_btn]
 
-    def vid_color():
+    def vid_icon():
         """VIDEO button: dim while Japo starts, normal when ready, accent while video plays."""
         if not engine.listening:
-            return C["faint"]
+            return "video_dim"
         if video["on"]:
             pl = video["player"]
-            return C["accent"] if (pl and pl.ready_to_play()) else C["text"]
-        return C["text"]
+            return "video_on" if (pl and pl.ready_to_play()) else "video"
+        return "video"
 
     # right: text size, theme, settings
     more_btn = FlatButton(inner, lambda: open_menu(), icon="settings", tip="Settings")
@@ -1959,6 +2036,19 @@ def run_ui():
     for code, name in TARGET_LANGS.items():
         tgt_menu.add_radiobutton(label=name, value=code, variable=tgt_var, command=set_langs)
     menu.add_cascade(label="Audio language", menu=src_menu)
+    q_var = tk.StringVar(value=engine.quality)
+
+    def set_quality():
+        state["quality"] = q_var.get()
+        engine.set_quality(q_var.get())
+        save_settings()
+
+    q_menu = paint(tk.Menu(menu, tearoff=0, bd=0, font=(UI, 9)), **MENU_COLORS)
+    for code, label in (("fast", "Fast – lightest"),
+                        ("balanced", "Balanced – better on fast talk and shouting"),
+                        ("accurate", "Accurate – large-v3 model, slower (~3 GB download)")):
+        q_menu.add_radiobutton(label=label, value=code, variable=q_var, command=set_quality)
+    menu.add_cascade(label="Recognition quality", menu=q_menu)
     menu.add_cascade(label="Translate to", menu=tgt_menu)
     menu.add_separator()
     uncensored_var = tk.BooleanVar(value=bool(state.get("uncensored")))
@@ -2329,26 +2419,41 @@ def run_ui():
 
     def exclude_from_capture(on):
         """Video mode: Japo can sit on top of the browser.
-        1) WDA_EXCLUDEFROMCAPTURE hides Japo's windows from screen capture (Windows 10 2004+).
-        2) A tiny bit of window transparency makes Japo a layered window; Chromium browsers
-           don't count those as covering them, so they keep drawing the video underneath."""
+        1) A tiny bit of window transparency makes Japo a layered window; Chromium browsers
+           don't count those as covering them, so they keep drawing the video underneath.
+        2) WDA_EXCLUDEFROMCAPTURE hides Japo's windows from screen capture (Windows 10 2004+),
+           otherwise Japo would film itself when it covers the video (zoomed/cropped picture).
+        The transparency is set first: changing the window style afterwards could drop (2)."""
         if os.name != "nt":
             return
         import ctypes
-        user32 = ctypes.windll.user32
-        user32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        root.update_idletasks()
-        for w in (root, backdrop):
-            try:
-                hwnd = user32.GetParent(w.winfo_id()) or w.winfo_id()
-                if not user32.SetWindowDisplayAffinity(hwnd, 0x11 if on else 0):
-                    print("SetWindowDisplayAffinity failed, error", ctypes.GetLastError(), flush=True)
-            except Exception as e:
-                print("Display affinity:", e, flush=True)
+        from ctypes import wintypes
         try:
             root.attributes("-alpha", 0.995 if on else 1.0)
         except tk.TclError:
             pass
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetParent.restype = wintypes.HWND
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+        user32.GetWindowDisplayAffinity.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        root.update_idletasks()
+        ok = True
+        for w in (root, backdrop):
+            try:
+                hwnd = user32.GetParent(w.winfo_id()) or w.winfo_id()
+                want = 0x11 if on else 0
+                if not user32.SetWindowDisplayAffinity(hwnd, want):
+                    print("SetWindowDisplayAffinity failed, error", ctypes.get_last_error(), flush=True)
+                got = wintypes.DWORD()
+                if user32.GetWindowDisplayAffinity(hwnd, ctypes.byref(got)) and w is root:
+                    ok = got.value == want
+            except Exception as e:
+                print("Display affinity:", e, flush=True)
+                ok = False
+        video["excluded"] = ok if on else False
+        if on and not ok:
+            print("Japo could not hide itself from screen capture", flush=True)
 
     def run_com(fn):
         """Run fn(japo_wasapi) on a multithreaded-COM worker thread and return its result."""
@@ -2483,6 +2588,21 @@ def run_ui():
         save_settings()
         return True
 
+    def new_video():
+        """NEW button: start over for another video (same app and area)."""
+        pl = video["player"]
+        if not pl:
+            return
+        pl.reset()
+        clear()                                   # subtitle list, history and 00:00 point
+        engine._context = []                      # previous film's lines are no context
+        video.update(info=None, sub_key=None, photo=None)
+        vcanvas.itemconfig(v_img, image="")
+        if pl.paused:
+            pl.paused = False
+            pause_btn.set_icon("pause")
+        draw_timeline(True)
+
     def redraw_area():
         """AREA button: choose the app and the video area again."""
         old_app = state.get("video_app")
@@ -2502,9 +2622,21 @@ def run_ui():
     tl_cv = paint(tk.Canvas(body, height=TL_H, highlightthickness=0, cursor="hand2"), bg="surface")
     tl = {"drag_t": None, "drawn": 0.0}
 
-    def tl_bar():
+    TL_FS = px(22)                                        # full-screen button size in the timeline
+
+    def tl_label_w():
+        """Room kept for the "−12:34  LIVE" label at the right end (fixed, so nothing jumps)."""
+        return tkfont.Font(font=(UI, 8, "bold")).measure("−88:88  LIVE") + px(4)
+
+    def tl_fs_rect():
+        """Full-screen button, just left of the LIVE label."""
         w = max(1, tl_cv.winfo_width())
-        return px(70), w - px(78)
+        x1 = w - px(12) - tl_label_w() - px(8)
+        y0 = (TL_H - TL_FS) / 2
+        return x1 - TL_FS, y0, x1, y0 + TL_FS
+
+    def tl_bar():
+        return px(70), tl_fs_rect()[0] - px(12)
 
     def draw_timeline(force=False):
         now = time.time()
@@ -2516,6 +2648,7 @@ def run_ui():
         cy = TL_H / 2
         if not pl or pl.play_t is None:
             tl_cv.create_text(px(12), cy, text="--:--", anchor="w", fill=C["muted"], font=(UI, 8))
+            draw_fs_icon(tl_cv, tl_fs_rect(), tl.get("fs_hover", False))
             return
         lo, hi = pl.time_range()
         pos = tl["drag_t"] if tl["drag_t"] is not None else pl.play_t
@@ -2529,6 +2662,7 @@ def run_ui():
         tl_cv.create_text(px(12), cy, text=fmt_elapsed(max(0.0, pos - pl.t_start)), anchor="w",
                           fill=C["text"], font=(UI, 9, "bold"))
         live = pl.is_live() and tl["drag_t"] is None
+        draw_fs_icon(tl_cv, tl_fs_rect(), tl.get("fs_hover", False))
         tl_cv.create_text(tl_cv.winfo_width() - px(12), cy, anchor="e", tags="live",
                           text="● LIVE" if live else f"−{fmt_elapsed(hi - pos)}  LIVE",
                           fill=C["accent"] if live else C["muted"], font=(UI, 8, "bold"))
@@ -2540,10 +2674,14 @@ def run_ui():
         return lo + (hi - lo) * min(1.0, max(0.0, (x - x0) / max(1, x1 - x0)))
 
     def tl_press(e):
+        x0, y0, x1, y1 = tl_fs_rect()
+        if x0 - px(3) <= e.x <= x1 + px(3):                  # full-screen button
+            toggle_fullscreen()
+            return
         pl = video["player"]
         if not pl or pl.play_t is None:
             return
-        if e.x > tl_bar()[1] + px(8):                      # "LIVE"
+        if e.x > tl_fs_rect()[2] + px(3):                    # "LIVE"
             pl.seek(pl.live_t())
             draw_timeline(True)
             return
@@ -2562,6 +2700,21 @@ def run_ui():
         tl["drag_t"] = None
         draw_timeline(True)
 
+    def tl_hover(e):
+        x0, _, x1, _ = tl_fs_rect()
+        over = x0 - px(3) <= e.x <= x1 + px(3)
+        tl_cv.config(cursor="hand2")
+        if over != tl.get("fs_hover"):
+            tl["fs_hover"] = over
+            draw_timeline(True)
+
+    def tl_leave(e):
+        if tl.get("fs_hover"):
+            tl["fs_hover"] = False
+            draw_timeline(True)
+
+    tl_cv.bind("<Motion>", tl_hover)
+    tl_cv.bind("<Leave>", tl_leave)
     tl_cv.bind("<ButtonPress-1>", tl_press)
     tl_cv.bind("<B1-Motion>", tl_motion)
     tl_cv.bind("<ButtonRelease-1>", tl_release)
@@ -2584,12 +2737,14 @@ def run_ui():
                 tl_cv.pack(side="bottom", fill="x")
             vcanvas.pack(fill="both", expand=True)
             area_btn.pack(side="left", padx=px(2), after=vid_btn)
+            new_btn.pack(side="left", padx=px(2), after=area_btn)
             vol_cv.pack(side="right", padx=(px(2), px(6)), after=font_dn_btn)
             draw_volume()
         else:
             vcanvas.pack_forget()
             tl_cv.pack_forget()
             area_btn.pack_forget()
+            new_btn.pack_forget()
             vol_cv.pack_forget()
             body.pack_configure(padx=(px(12), px(4)), pady=(px(4), 0))
             sb.pack(side="right", fill="y", padx=(px(4), 0))
@@ -2624,18 +2779,27 @@ def run_ui():
         engine.paused = False
         pause_btn.set_icon("pause")
         if root.state() == "normal":
-            state["geometry"] = root.geometry()
+            state["width"] = int(root.winfo_width() / scale)
+            state["geometry"] = root.geometry()          # remember the normal layout
+        video["switching"] = True
         video.update(on=True, player=pl, sub_key=None, info=None, size=None, photo=None)
         vcanvas.delete("sub", "info")
         vcanvas.itemconfig(v_img, image="")
         show_video_area(True)
-        root.geometry(video_geometry())
+        root.geometry(video_geometry())                  # the size used last time in video mode
+        root.update_idletasks()
+        video["switching"] = False
         exclude_from_capture(True)
         save_settings()
         root.after(30, video_tick)
 
     def stop_video():
+        if video.get("fullscreen"):
+            set_fullscreen(False)
         pl = video["player"]
+        if root.state() == "normal":
+            state["geometry_video"] = root.geometry()    # remember the video layout
+        video["switching"] = True
         video.update(on=False, player=None, photo=None)
         if pl:
             pl.stop()
@@ -2643,16 +2807,23 @@ def run_ui():
             engine.use_system_audio()
         except Exception as e:
             add_error(f"Could not return to system audio: {e}")
-        if root.state() == "normal":
-            state["geometry_video"] = root.geometry()
         show_video_area(False)
-        restore_position()
+        restore_position()                               # the normal layout's size and position
+        root.update_idletasks()
+        video["switching"] = False
         exclude_from_capture(False)
         pause_btn.set_icon("play" if engine.paused else "pause")
         save_settings()
 
     def toggle_video():
         stop_video() if video["on"] else start_video()
+
+    def covers_capture_area():
+        r = state.get("video_region")
+        if not r:
+            return False
+        x, y, w, h = root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height()
+        return x < r[0] + r[2] and r[0] < x + w and y < r[1] + r[3] and r[1] < y + h
 
     def draw_overlay(pl, w, h):
         """Status text (top right). The subtitle itself is drawn into the frame by the player."""
@@ -2668,6 +2839,8 @@ def run_ui():
             info = "Translating…"
         elif pl.grabber and pl.grabber.error:
             info = pl.grabber.error
+        elif video.get("excluded") is False and covers_capture_area():
+            info = "Japo is covering the video area and can't hide itself from capture – move Japo aside"
         else:
             info = ""
         if info != video["info"]:
@@ -2701,6 +2874,7 @@ def run_ui():
             vcanvas.coords(v_img, w // 2, h // 2)
             video["info"] = None
             draw_box_ui()
+            draw_fs_button(bool(video.get("fs_hover")))
         push_style(pl)
         frame = pl.take_image()
         if frame is not None:
@@ -2747,8 +2921,97 @@ def run_ui():
     CURSORS = {"move": "fleur", "nw": "size_nw_se", "se": "size_nw_se",
                "ne": "size_ne_sw", "sw": "size_ne_sw"}
 
+    # ---- Full screen: button in the bottom-right corner of the video, F11 / double-click, Esc to leave
+    FS = px(26)
+
+    def draw_fs_icon(cv, rect, hover=False, tag="fsbtn"):
+        """Full-screen icon: four corner brackets (pointing inwards while full screen)."""
+        cv.delete(tag)
+        x0, y0, x1, y1 = rect
+        cv.create_rectangle(x0, y0, x1, y1, fill=C["hover"] if hover else C["surface"],
+                            outline=C["border"], tags=tag)
+        size = x1 - x0
+        m, k = size * 0.25, size * 0.14
+        col = C["text"] if hover else C["muted"]
+        lw = max(2, px(1.6))
+        for cx, cy, dx, dy in ((x0 + m, y0 + m, 1, 1), (x1 - m, y0 + m, -1, 1),
+                               (x0 + m, y1 - m, 1, -1), (x1 - m, y1 - m, -1, -1)):
+            if video.get("fullscreen"):
+                cx, cy, dx, dy = cx + dx * k, cy + dy * k, -dx, -dy
+            cv.create_line(cx, cy + dy * k, cx, cy, cx + dx * k, cy, fill=col, width=lw,
+                           capstyle="projecting", tags=tag)
+        cv.tag_raise(tag)
+
+    def fs_in_timeline():
+        return tl_cv.winfo_ismapped()
+
+    def fs_rect():
+        """Video-corner button (used when there is no timeline): tight in the bottom-right corner."""
+        w, h = vcanvas.winfo_width(), vcanvas.winfo_height()
+        return w - FS - px(6), h - FS - px(6), w - px(6), h - px(6)
+
+    def draw_fs_button(hover=False):
+        if fs_in_timeline():
+            vcanvas.delete("fsbtn")
+            draw_timeline(True)
+            return
+        draw_fs_icon(vcanvas, fs_rect(), hover)
+
+    def on_fs_button(x, y):
+        if fs_in_timeline():
+            return False
+        x0, y0, x1, y1 = fs_rect()
+        return x0 <= x <= x1 and y0 <= y <= y1
+
+    def set_fullscreen(on):
+        if on == bool(video.get("fullscreen")) or (on and not video["on"]):
+            return
+        if on:
+            if root.state() == "normal":
+                state["geometry_video"] = root.geometry()
+                save_settings()
+            # hide everything around the video (toolbar, film context, status bar…)
+            video["hidden"] = [(w, w.pack_info()) for w in root.pack_slaves() if w is not body]
+            for w, _ in video["hidden"]:
+                w.pack_forget()
+            video["fullscreen"] = True
+            root.attributes("-fullscreen", True)
+            # Going full screen can reset the window's capture exclusion / layered style
+            for ms in (50, 400):
+                root.after(ms, lambda: video["on"] and exclude_from_capture(True))
+        else:
+            video["fullscreen"] = False
+            root.attributes("-fullscreen", False)
+            body.pack_forget()
+            for w, info in video.get("hidden", []):           # restore the original layout order
+                info = {k: v for k, v in info.items() if k != "in"}
+                w.pack(**info)
+            body.pack(side="top", fill="both", expand=True, padx=0, pady=0)
+            video["hidden"] = []
+            root.geometry(video_geometry())
+            # Leaving full screen resets the Windows title bar colors: apply the theme again
+            for ms in (30, 250):
+                root.after(ms, style_titlebar)
+            for ms in (50, 400):
+                root.after(ms, lambda: video["on"] and exclude_from_capture(True))
+        video["size"] = None                                  # re-layout the video at the new size
+        root.after(50, draw_fs_button)
+
+    def toggle_fullscreen(_=None):
+        set_fullscreen(not video.get("fullscreen"))
+
+    root.bind("<F11>", lambda e: toggle_fullscreen(), add="+")
+    root.bind("<Escape>", lambda e: set_fullscreen(False), add="+")
+
     def canvas_motion(e):
         if video["drag"]:
+            return
+        over_fs = on_fs_button(e.x, e.y)
+        if over_fs != video.get("fs_hover"):
+            video["fs_hover"] = over_fs
+            draw_fs_button(over_fs)
+        if over_fs:
+            vcanvas.config(cursor="hand2")
             return
         hit = hit_box(e.x, e.y)
         hover = hit is not None
@@ -2758,6 +3021,9 @@ def run_ui():
             draw_box_ui()
 
     def canvas_press(e):
+        if on_fs_button(e.x, e.y):
+            toggle_fullscreen()
+            return
         hit = hit_box(e.x, e.y)
         if hit:
             w, h, _ = sub_box_px()
@@ -2804,6 +3070,9 @@ def run_ui():
             canvas_motion(e)
 
     def canvas_leave(e):
+        if video.get("fs_hover"):
+            video["fs_hover"] = False
+            draw_fs_button(False)
         if not video["drag"] and video["hover"]:
             video["hover"] = False
             vcanvas.config(cursor="")
@@ -2815,6 +3084,8 @@ def run_ui():
     vcanvas.bind("<B1-Motion>", canvas_drag)
     vcanvas.bind("<ButtonRelease-1>", canvas_release)
     vcanvas.bind("<Leave>", canvas_leave)
+    vcanvas.bind("<Double-Button-1>", lambda e: None if (hit_box(e.x, e.y) or on_fs_button(e.x, e.y))
+                 else toggle_fullscreen())
 
     video_menu = paint(tk.Menu(menu, tearoff=0, bd=0, font=(UI, 9)), **MENU_COLORS)
     delay_var = tk.IntVar(value=int(state.get("video_delay", 10)))
@@ -2942,9 +3213,9 @@ def run_ui():
         if video["on"] and vol_state.get("theme") != state["theme"]:
             vol_state["theme"] = state["theme"]
             draw_volume()
-        want = vid_color()
-        if vid_btn.cget("fg") != want:
-            vid_btn.config(fg=want)
+        want = vid_icon()
+        if vid_btn.icon != want:
+            vid_btn.set_icon(want)
         src_label = engine.src().upper()
         if ja_btn.cget("text") != src_label:
             ja_btn.config(text=src_label)
